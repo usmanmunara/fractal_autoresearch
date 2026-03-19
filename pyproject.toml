@@ -1,0 +1,14 @@
+[project]
+name = "fractal-agents"
+version = "0.1.0"
+description = "Autonomous fractal research: training small nets and discovering their fractal properties"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "numpy",
+    "matplotlib",
+    "tiktoken",
+    "requests",
+    "scipy",
+]
