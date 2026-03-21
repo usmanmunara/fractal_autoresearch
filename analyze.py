@@ -1130,6 +1130,351 @@ def exp_loss_landscape():
     print(f"  H > 0.5 → smooth/persistent, H < 0.5 → rough/anti-persistent, H = 0.5 → Brownian")
 
 
+# --- Experiment 14: Hidden representation self-similarity ---
+
+def exp_representation_similarity():
+    """
+    Feed data through the trained model and capture hidden representations
+    at every layer. Measure how similar the representations are across layers
+    using CKA (Centered Kernel Alignment) and cosine similarity of their
+    singular value spectra. If representations are self-similar, we should
+    see structured (not random) similarity patterns.
+    """
+    checkpoints = get_checkpoints()
+    final_model = load_checkpoint(checkpoints[-1])
+
+    # load data
+    data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                     dtype=np.uint16, mode="r")
+    # use multiple sequences for stable statistics
+    n_seqs = 16
+    x = torch.stack([
+        torch.from_numpy(data[i*BLOCK_SIZE:(i+1)*BLOCK_SIZE].astype(np.int64))
+        for i in range(n_seqs)
+    ])
+
+    # forward pass, capturing hidden states at each layer
+    final_model.eval()
+    hidden_states = []
+    with torch.no_grad():
+        B, T = x.size()
+        pos = torch.arange(0, T, dtype=torch.long)
+        h = final_model.drop(final_model.wte(x) + final_model.wpe(pos))
+        hidden_states.append(h.numpy().reshape(B * T, -1))  # after embedding
+
+        for i, block in enumerate(final_model.blocks):
+            h = h + block.attn(block.ln_1(h))
+            h = h + block.mlp(block.ln_2(h))
+            hidden_states.append(h.numpy().reshape(B * T, -1))
+
+    n_layers = len(hidden_states)
+    layer_names = ["embed"] + [f"L{i}" for i in range(N_LAYER)]
+
+    # --- 1. CKA (linear) between all layer pairs ---
+    def linear_cka(X, Y):
+        """Centered Kernel Alignment — measures representation similarity."""
+        # center
+        X = X - X.mean(axis=0)
+        Y = Y - Y.mean(axis=0)
+        hsic_xy = np.linalg.norm(X.T @ Y, 'fro') ** 2
+        hsic_xx = np.linalg.norm(X.T @ X, 'fro') ** 2
+        hsic_yy = np.linalg.norm(Y.T @ Y, 'fro') ** 2
+        return hsic_xy / np.sqrt(hsic_xx * hsic_yy)
+
+    cka_matrix = np.zeros((n_layers, n_layers))
+    for i in range(n_layers):
+        for j in range(n_layers):
+            cka_matrix[i, j] = linear_cka(hidden_states[i], hidden_states[j])
+
+    # --- 2. Singular value spectra of each layer's representations ---
+    sv_spectra = []
+    for h in hidden_states:
+        sv = np.linalg.svd(h - h.mean(axis=0), compute_uv=False)
+        sv = sv / sv.sum()  # normalize
+        sv_spectra.append(sv)
+
+    # cosine similarity of spectra
+    spec_sim = np.zeros((n_layers, n_layers))
+    for i in range(n_layers):
+        for j in range(n_layers):
+            min_len = min(len(sv_spectra[i]), len(sv_spectra[j]))
+            a, b = sv_spectra[i][:min_len], sv_spectra[j][:min_len]
+            spec_sim[i, j] = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    # --- 3. Effective dimensionality (participation ratio) per layer ---
+    eff_dims = []
+    for sv in sv_spectra:
+        p = sv ** 2
+        p = p / p.sum()
+        pr = 1.0 / (p ** 2).sum()  # participation ratio
+        eff_dims.append(pr)
+
+    # --- Plot ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig.suptitle("Hidden Representation Self-Similarity Across Layers", fontsize=14)
+
+    # CKA matrix
+    im0 = axes[0, 0].imshow(cka_matrix, cmap="magma", vmin=0, vmax=1)
+    axes[0, 0].set_xticks(range(n_layers))
+    axes[0, 0].set_xticklabels(layer_names, fontsize=8)
+    axes[0, 0].set_yticks(range(n_layers))
+    axes[0, 0].set_yticklabels(layer_names, fontsize=8)
+    axes[0, 0].set_title("Linear CKA (representation similarity)")
+    plt.colorbar(im0, ax=axes[0, 0])
+    # annotate
+    for i in range(n_layers):
+        for j in range(n_layers):
+            axes[0, 0].text(j, i, f"{cka_matrix[i,j]:.2f}", ha="center", va="center",
+                           fontsize=7, color="white" if cka_matrix[i,j] < 0.5 else "black")
+
+    # spectral similarity matrix
+    im1 = axes[0, 1].imshow(spec_sim, cmap="magma", vmin=0.9, vmax=1)
+    axes[0, 1].set_xticks(range(n_layers))
+    axes[0, 1].set_xticklabels(layer_names, fontsize=8)
+    axes[0, 1].set_yticks(range(n_layers))
+    axes[0, 1].set_yticklabels(layer_names, fontsize=8)
+    axes[0, 1].set_title("Spectral cosine similarity")
+    plt.colorbar(im1, ax=axes[0, 1])
+    for i in range(n_layers):
+        for j in range(n_layers):
+            axes[0, 1].text(j, i, f"{spec_sim[i,j]:.3f}", ha="center", va="center",
+                           fontsize=6, color="white" if spec_sim[i,j] < 0.95 else "black")
+
+    # SV spectra overlay (log-log)
+    colors = plt.cm.viridis(np.linspace(0, 1, n_layers))
+    for i, (sv, name) in enumerate(zip(sv_spectra, layer_names)):
+        axes[1, 0].loglog(np.arange(1, len(sv)+1), sv, "-", color=colors[i],
+                          label=name, alpha=0.8, linewidth=1.5)
+    axes[1, 0].set_xlabel("Rank")
+    axes[1, 0].set_ylabel("Normalized singular value")
+    axes[1, 0].set_title("Representation spectra (log-log)")
+    axes[1, 0].legend(fontsize=7, ncol=2)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # effective dimensionality
+    axes[1, 1].bar(range(n_layers), eff_dims, color=colors)
+    axes[1, 1].set_xticks(range(n_layers))
+    axes[1, 1].set_xticklabels(layer_names, fontsize=8)
+    axes[1, 1].set_ylabel("Effective dimensionality (participation ratio)")
+    axes[1, 1].set_title("Representation dimensionality per layer")
+    axes[1, 1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "representation_similarity.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    print(f"\nCKA matrix diagonal (self-similarity = 1.0):")
+    for i, name in enumerate(layer_names):
+        neighbors = []
+        if i > 0:
+            neighbors.append(f"CKA({layer_names[i-1]})={cka_matrix[i,i-1]:.3f}")
+        if i < n_layers - 1:
+            neighbors.append(f"CKA({layer_names[i+1]})={cka_matrix[i,i+1]:.3f}")
+        print(f"  {name}: eff_dim={eff_dims[i]:.1f}, {', '.join(neighbors)}")
+
+    # distant layer similarity (how similar are layers far apart?)
+    print(f"\nDistant layer CKA:")
+    print(f"  embed vs L5: {cka_matrix[0, -1]:.4f}")
+    print(f"  L0 vs L5:    {cka_matrix[1, -1]:.4f}")
+    print(f"  L1 vs L4:    {cka_matrix[2, 5]:.4f}")
+
+
+# --- Experiment 15: Activation distribution fractal dimension ---
+
+def exp_activation_fractals():
+    """
+    Analyze the distribution of activations at each layer. Measure:
+    1. Whether activation distributions follow power laws (heavy tails)
+    2. How the distribution shape changes across layers (self-similarity)
+    3. Fractal dimension of the activation space via correlation dimension
+    """
+    checkpoints = get_checkpoints()
+    final_model = load_checkpoint(checkpoints[-1])
+
+    data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                     dtype=np.uint16, mode="r")
+    n_seqs = 32
+    x = torch.stack([
+        torch.from_numpy(data[i*BLOCK_SIZE:(i+1)*BLOCK_SIZE].astype(np.int64))
+        for i in range(n_seqs)
+    ])
+
+    # collect activations
+    final_model.eval()
+    activations = {}
+    with torch.no_grad():
+        B, T = x.size()
+        pos = torch.arange(0, T, dtype=torch.long)
+        h = final_model.drop(final_model.wte(x) + final_model.wpe(pos))
+        activations["embed"] = h.numpy().flatten()
+
+        for i, block in enumerate(final_model.blocks):
+            # capture pre-attention, post-attention, post-MLP
+            attn_out = block.attn(block.ln_1(h))
+            h = h + attn_out
+            activations[f"L{i}_attn"] = attn_out.numpy().flatten()
+
+            mlp_out = block.mlp(block.ln_2(h))
+            h = h + mlp_out
+            activations[f"L{i}_mlp"] = mlp_out.numpy().flatten()
+
+        h = final_model.ln_f(h)
+        activations["final"] = h.numpy().flatten()
+
+    layer_names = list(activations.keys())
+    print(f"Collected activations from {len(layer_names)} points")
+
+    # --- 1. Distribution shape analysis ---
+    fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+    fig.suptitle("Activation Distributions Across Layers\nLooking for heavy tails and self-similar shapes", fontsize=13)
+    axes_flat = axes.flatten()
+
+    kurtosis_values = []
+    tail_exponents = []
+
+    for idx, name in enumerate(layer_names):
+        if idx >= len(axes_flat):
+            break
+        ax = axes_flat[idx]
+        vals = activations[name]
+
+        # histogram on log scale
+        # use absolute values for tail analysis
+        abs_vals = np.abs(vals)
+        abs_vals = abs_vals[abs_vals > 1e-6]
+
+        ax.hist(vals, bins=200, density=True, alpha=0.7, color="steelblue", log=True)
+        ax.set_title(name, fontsize=9)
+        ax.set_xlim(-5 * vals.std(), 5 * vals.std())
+
+        # kurtosis (Gaussian = 3, heavy-tailed > 3)
+        kurt = float(stats.kurtosis(vals, fisher=False))
+        kurtosis_values.append((name, kurt))
+        ax.text(0.95, 0.95, f"K={kurt:.1f}", transform=ax.transAxes,
+                fontsize=7, ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="yellow", alpha=0.7))
+
+        # fit power-law tail to the positive side
+        sorted_abs = np.sort(abs_vals)[::-1]
+        n_tail = len(sorted_abs) // 10  # top 10%
+        if n_tail > 20:
+            tail = sorted_abs[:n_tail]
+            ranks = np.arange(1, n_tail + 1)
+            slope, _, r, _, _ = stats.linregress(np.log(ranks), np.log(tail))
+            tail_exponents.append((name, -slope, r**2))
+
+    # hide unused axes
+    for idx in range(len(layer_names), len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "activation_distributions.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    # --- 2. Kurtosis evolution across layers ---
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Activation Statistics Across Layers", fontsize=13)
+
+    names_k, kurts = zip(*kurtosis_values)
+    colors_k = ["coral" if "attn" in n else "steelblue" if "mlp" in n else "gray" for n in names_k]
+    axes[0].bar(range(len(kurts)), kurts, color=colors_k)
+    axes[0].set_xticks(range(len(kurts)))
+    axes[0].set_xticklabels(names_k, rotation=45, ha="right", fontsize=7)
+    axes[0].set_ylabel("Kurtosis")
+    axes[0].set_title("Kurtosis per layer (Gaussian=3, heavy-tailed>3)")
+    axes[0].axhline(y=3, color="black", linestyle="--", alpha=0.5, label="Gaussian")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3, axis="y")
+
+    # tail exponents
+    if tail_exponents:
+        names_t, alphas_t, r2s = zip(*tail_exponents)
+        colors_t = ["coral" if "attn" in n else "steelblue" if "mlp" in n else "gray" for n in names_t]
+        axes[1].bar(range(len(alphas_t)), alphas_t, color=colors_t)
+        axes[1].set_xticks(range(len(alphas_t)))
+        axes[1].set_xticklabels(names_t, rotation=45, ha="right", fontsize=7)
+        axes[1].set_ylabel("Tail exponent α")
+        axes[1].set_title("Power-law tail exponent (rank-frequency)")
+        axes[1].grid(True, alpha=0.3, axis="y")
+
+    # --- 3. Correlation dimension estimate ---
+    # Use a subsample of the high-dimensional activation vectors
+    # Correlation dimension: how does the number of pairs within distance r scale with r?
+    print("Computing correlation dimensions...")
+    corr_dims = []
+    for name in ["embed", "L0_attn", "L2_attn", "L5_attn", "L0_mlp", "L2_mlp", "L5_mlp", "final"]:
+        if name not in activations:
+            continue
+        vals = activations[name]
+        # reshape to (n_samples, n_features) — use token-level vectors
+        n_tokens = n_seqs * BLOCK_SIZE
+        n_feat = len(vals) // n_tokens
+        vecs = vals.reshape(n_tokens, n_feat)
+
+        # subsample for speed
+        n_sub = min(500, n_tokens)
+        idx = np.random.RandomState(42).choice(n_tokens, n_sub, replace=False)
+        vecs_sub = vecs[idx]
+
+        # pairwise distances
+        dists = []
+        for i in range(n_sub):
+            d = np.linalg.norm(vecs_sub[i] - vecs_sub[i+1:], axis=1)
+            dists.extend(d.tolist())
+        dists = np.array(dists)
+        dists = dists[dists > 0]
+
+        # correlation integral: C(r) = fraction of pairs with dist < r
+        r_values = np.logspace(np.log10(np.percentile(dists, 1)),
+                               np.log10(np.percentile(dists, 90)), 30)
+        C_values = np.array([np.mean(dists < r) for r in r_values])
+        C_values = C_values[C_values > 0]
+        r_values = r_values[:len(C_values)]
+
+        if len(C_values) > 5:
+            # fit in the scaling region (middle portion)
+            mid = len(C_values) // 4
+            end = 3 * len(C_values) // 4
+            slope, _, r, _, _ = stats.linregress(
+                np.log(r_values[mid:end]), np.log(C_values[mid:end]))
+            corr_dims.append((name, slope, r**2))
+
+    if corr_dims:
+        names_c, dims_c, r2s_c = zip(*corr_dims)
+        colors_c = ["coral" if "attn" in n else "steelblue" if "mlp" in n else "gray" for n in names_c]
+        axes[2].bar(range(len(dims_c)), dims_c, color=colors_c)
+        axes[2].set_xticks(range(len(dims_c)))
+        axes[2].set_xticklabels(names_c, rotation=45, ha="right", fontsize=7)
+        axes[2].set_ylabel("Correlation dimension")
+        axes[2].set_title("Correlation dimension of activation space")
+        axes[2].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "activation_statistics.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    print(f"\nKurtosis (Gaussian=3, heavy-tailed>3):")
+    for name, k in kurtosis_values:
+        tag = " ← HEAVY-TAILED" if k > 5 else ""
+        print(f"  {name}: {k:.2f}{tag}")
+
+    if tail_exponents:
+        print(f"\nTail exponents:")
+        for name, alpha, r2 in tail_exponents:
+            print(f"  {name}: α={alpha:.3f} (R²={r2:.3f})")
+
+    if corr_dims:
+        print(f"\nCorrelation dimensions:")
+        for name, d, r2 in corr_dims:
+            print(f"  {name}: D_corr={d:.3f} (R²={r2:.3f})")
+
+
 # --- registry ---
 
 EXPERIMENTS = {
@@ -1146,6 +1491,8 @@ EXPERIMENTS = {
     "attn_maps": exp_attention_maps,
     "sgd_trajectory": exp_sgd_trajectory,
     "loss_landscape": exp_loss_landscape,
+    "repr_sim": exp_representation_similarity,
+    "act_fractals": exp_activation_fractals,
 }
 
 
