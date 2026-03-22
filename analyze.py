@@ -1475,6 +1475,300 @@ def exp_activation_fractals():
             print(f"  {name}: D_corr={d:.3f} (R²={r2:.3f})")
 
 
+# --- Experiment 16: Gradient fractal structure ---
+
+def exp_gradient_fractals():
+    """
+    Compute gradients on a batch of data and analyze their distribution
+    and spectral properties. Simsekli et al. (2019) showed SGD gradient
+    noise is heavy-tailed — can we see this in our small model?
+    """
+    checkpoints = get_checkpoints()
+
+    data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                     dtype=np.uint16, mode="r")
+
+    # analyze gradients at multiple training stages
+    stages = [0, len(checkpoints)//4, len(checkpoints)//2, 3*len(checkpoints)//4, -1]
+    stages = list(dict.fromkeys(stages))  # deduplicate
+    stage_names = []
+    all_grad_stats = []  # (name, step, layer_name, kurtosis, tail_alpha)
+
+    for stage_idx in stages:
+        ckpt_path = checkpoints[stage_idx]
+        step = int(os.path.basename(ckpt_path).split("_")[1].split(".")[0])
+        stage_names.append(f"step_{step}")
+        model = load_checkpoint(ckpt_path)
+        model.train()
+
+        # compute gradients on multiple batches and accumulate
+        grad_accum = {}
+        n_batches = 8
+        for b in range(n_batches):
+            offset = b * BLOCK_SIZE * 4
+            ix = [offset + i * BLOCK_SIZE for i in range(4)
+                  if offset + (i + 1) * BLOCK_SIZE + 1 < len(data)]
+            if not ix:
+                break
+            x = torch.stack([torch.from_numpy(data[i:i+BLOCK_SIZE].astype(np.int64)) for i in ix])
+            y = torch.stack([torch.from_numpy(data[i+1:i+1+BLOCK_SIZE].astype(np.int64)) for i in ix])
+
+            model.zero_grad()
+            _, loss = model(x, y)
+            loss.backward()
+
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    g = param.grad.detach().cpu().numpy().flatten()
+                    if name not in grad_accum:
+                        grad_accum[name] = []
+                    grad_accum[name].append(g.copy())
+
+        # analyze each layer's gradients
+        for layer_name, grads_list in grad_accum.items():
+            all_grads = np.concatenate(grads_list)
+            kurt = float(stats.kurtosis(all_grads, fisher=False))
+            # tail exponent
+            abs_g = np.abs(all_grads)
+            abs_g = abs_g[abs_g > 1e-10]
+            sorted_g = np.sort(abs_g)[::-1]
+            n_tail = len(sorted_g) // 10
+            alpha, r2 = 0.0, 0.0
+            if n_tail > 20:
+                tail = sorted_g[:n_tail]
+                ranks = np.arange(1, n_tail + 1)
+                slope, _, r, _, _ = stats.linregress(np.log(ranks), np.log(tail))
+                alpha, r2 = -slope, r**2
+            all_grad_stats.append((step, layer_name, kurt, alpha, r2))
+
+    # organize by layer type for plotting
+    # pick key layers to show
+    key_layers = []
+    for name in grad_accum.keys():
+        if any(k in name for k in ["c_attn.weight", "c_proj.weight", "c_fc.weight"]):
+            key_layers.append(name)
+
+    # --- Plot 1: Gradient distributions at final checkpoint ---
+    final_model = load_checkpoint(checkpoints[-1])
+    final_model.train()
+    final_model.zero_grad()
+    x = torch.stack([torch.from_numpy(data[i*BLOCK_SIZE:(i+1)*BLOCK_SIZE].astype(np.int64))
+                     for i in range(8)])
+    y = torch.stack([torch.from_numpy(data[i*BLOCK_SIZE+1:(i+1)*BLOCK_SIZE+1].astype(np.int64))
+                     for i in range(8)])
+    _, loss = final_model(x, y)
+    loss.backward()
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle("Gradient Distributions at Final Checkpoint\nHeavy tails = non-Gaussian gradient noise", fontsize=13)
+
+    for idx, layer_name in enumerate(key_layers[:6]):
+        ax = axes[idx // 3, idx % 3]
+        for name, param in final_model.named_parameters():
+            if name == layer_name:
+                g = param.grad.detach().numpy().flatten()
+                ax.hist(g, bins=200, density=True, alpha=0.7, color="steelblue", log=True)
+                kurt = float(stats.kurtosis(g, fisher=False))
+                ax.set_title(f"{name}\nK={kurt:.1f}", fontsize=8)
+                # overlay Gaussian for comparison
+                std = g.std()
+                x_range = np.linspace(g.min(), g.max(), 200)
+                gaussian = stats.norm.pdf(x_range, 0, std)
+                ax.plot(x_range, gaussian, "r--", alpha=0.7, label="Gaussian")
+                ax.legend(fontsize=7)
+                break
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "gradient_distributions.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    # --- Plot 2: Kurtosis evolution during training ---
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Gradient Statistics During Training", fontsize=13)
+
+    # kurtosis evolution for key layers
+    for layer_name in key_layers[:6]:
+        steps_layer = []
+        kurts_layer = []
+        for step, ln, kurt, alpha, r2 in all_grad_stats:
+            if ln == layer_name:
+                steps_layer.append(step)
+                kurts_layer.append(kurt)
+        short_name = layer_name.replace("blocks.", "L").replace(".attn.", ".").replace(".mlp.", ".")
+        axes[0].plot(steps_layer, kurts_layer, "o-", label=short_name, markersize=4)
+    axes[0].axhline(y=3, color="black", linestyle="--", alpha=0.5, label="Gaussian")
+    axes[0].set_xlabel("Training step")
+    axes[0].set_ylabel("Kurtosis")
+    axes[0].set_title("Gradient kurtosis evolution")
+    axes[0].legend(fontsize=6, ncol=2)
+    axes[0].grid(True, alpha=0.3)
+
+    # tail exponent evolution
+    for layer_name in key_layers[:6]:
+        steps_layer = []
+        alphas_layer = []
+        for step, ln, kurt, alpha, r2 in all_grad_stats:
+            if ln == layer_name and r2 > 0.8:
+                steps_layer.append(step)
+                alphas_layer.append(alpha)
+        short_name = layer_name.replace("blocks.", "L").replace(".attn.", ".").replace(".mlp.", ".")
+        axes[1].plot(steps_layer, alphas_layer, "o-", label=short_name, markersize=4)
+    axes[1].set_xlabel("Training step")
+    axes[1].set_ylabel("Tail exponent α")
+    axes[1].set_title("Gradient tail exponent evolution")
+    axes[1].legend(fontsize=6, ncol=2)
+    axes[1].grid(True, alpha=0.3)
+
+    # singular value spectrum of gradient matrices at final step
+    for name, param in final_model.named_parameters():
+        if name in key_layers[:6] and param.grad is not None:
+            g = param.grad.detach().numpy()
+            if g.ndim == 2:
+                sv = np.linalg.svd(g, compute_uv=False)
+                sv = sv[sv > 1e-12]
+                short_name = name.replace("blocks.", "L").replace(".attn.", ".").replace(".mlp.", ".")
+                axes[2].loglog(np.arange(1, len(sv)+1), sv, "o-", markersize=2,
+                              label=short_name, alpha=0.8)
+    axes[2].set_xlabel("Rank")
+    axes[2].set_ylabel("Singular value")
+    axes[2].set_title("Gradient matrix SVD (log-log)")
+    axes[2].legend(fontsize=6, ncol=2)
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "gradient_evolution.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    # print summary
+    final_step = max(s for s, _, _, _, _ in all_grad_stats)
+    print(f"\nGradient statistics at step {final_step}:")
+    for step, ln, kurt, alpha, r2 in all_grad_stats:
+        if step == final_step and ln in key_layers:
+            short = ln.replace("blocks.", "L").replace(".attn.", ".").replace(".mlp.", ".")
+            tag = " ← HEAVY" if kurt > 5 else ""
+            print(f"  {short}: kurtosis={kurt:.1f}, α={alpha:.3f} (R²={r2:.3f}){tag}")
+
+
+# --- Experiment 17: Init vs trained fractal summary ---
+
+def exp_init_vs_trained():
+    """
+    Side-by-side comparison of fractal properties at initialization vs after training.
+    One unified plot showing how every metric changes.
+    """
+    checkpoints = get_checkpoints()
+    init_model = load_checkpoint(checkpoints[0])
+    final_model = load_checkpoint(checkpoints[-1])
+
+    models = {"Init": init_model, "Trained": final_model}
+    colors = {"Init": "gray", "Trained": "blue"}
+
+    # collect metrics per layer for both models
+    results = {}
+    for tag, model in models.items():
+        layer_names = []
+        sv_slopes = []
+        sv_r2s = []
+        kurtoses = []
+        top_sv_ratios = []
+
+        for name, param in model.named_parameters():
+            if param.ndim != 2 or param.shape[0] < 10:
+                continue
+            w = param.detach().numpy()
+            sv = np.linalg.svd(w, compute_uv=False)
+            sv = sv[sv > 1e-10]
+
+            # power-law fit
+            ranks = np.arange(1, len(sv) + 1)
+            slope, _, r, _, _ = stats.linregress(np.log(ranks), np.log(sv))
+            sv_slopes.append(-slope)
+            sv_r2s.append(r**2)
+
+            # kurtosis of weights
+            kurt = float(stats.kurtosis(w.flatten(), fisher=False))
+            kurtoses.append(kurt)
+
+            # top SV concentration
+            top_sv_ratios.append(sv[0] / sv.sum())
+
+            short = name.replace("blocks.", "L").replace(".attn.", ".").replace(".mlp.", ".")
+            layer_names.append(short)
+
+        results[tag] = {
+            "layers": layer_names,
+            "slopes": sv_slopes,
+            "r2s": sv_r2s,
+            "kurtoses": kurtoses,
+            "top_sv": top_sv_ratios,
+        }
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle("Init vs Trained: Fractal Properties Side-by-Side", fontsize=14)
+
+    n = len(results["Init"]["layers"])
+    x_pos = np.arange(n)
+    width = 0.35
+
+    # power-law exponents
+    axes[0, 0].bar(x_pos - width/2, results["Init"]["slopes"], width, color="gray", alpha=0.7, label="Init")
+    axes[0, 0].bar(x_pos + width/2, results["Trained"]["slopes"], width, color="blue", alpha=0.7, label="Trained")
+    axes[0, 0].set_xticks(x_pos)
+    axes[0, 0].set_xticklabels(results["Init"]["layers"], rotation=45, ha="right", fontsize=6)
+    axes[0, 0].set_ylabel("Power-law exponent α")
+    axes[0, 0].set_title("SV power-law exponents")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3, axis="y")
+
+    # R² of power-law fit
+    axes[0, 1].bar(x_pos - width/2, results["Init"]["r2s"], width, color="gray", alpha=0.7, label="Init")
+    axes[0, 1].bar(x_pos + width/2, results["Trained"]["r2s"], width, color="blue", alpha=0.7, label="Trained")
+    axes[0, 1].set_xticks(x_pos)
+    axes[0, 1].set_xticklabels(results["Init"]["layers"], rotation=45, ha="right", fontsize=6)
+    axes[0, 1].set_ylabel("R²")
+    axes[0, 1].set_title("Power-law fit quality (R²)")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3, axis="y")
+
+    # weight kurtosis
+    axes[1, 0].bar(x_pos - width/2, results["Init"]["kurtoses"], width, color="gray", alpha=0.7, label="Init")
+    axes[1, 0].bar(x_pos + width/2, results["Trained"]["kurtoses"], width, color="blue", alpha=0.7, label="Trained")
+    axes[1, 0].axhline(y=3, color="black", linestyle="--", alpha=0.5)
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(results["Init"]["layers"], rotation=45, ha="right", fontsize=6)
+    axes[1, 0].set_ylabel("Kurtosis")
+    axes[1, 0].set_title("Weight kurtosis (Gaussian=3)")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3, axis="y")
+
+    # top SV concentration
+    axes[1, 1].bar(x_pos - width/2, results["Init"]["top_sv"], width, color="gray", alpha=0.7, label="Init")
+    axes[1, 1].bar(x_pos + width/2, results["Trained"]["top_sv"], width, color="blue", alpha=0.7, label="Trained")
+    axes[1, 1].set_xticks(x_pos)
+    axes[1, 1].set_xticklabels(results["Init"]["layers"], rotation=45, ha="right", fontsize=6)
+    axes[1, 1].set_ylabel("σ₁ / Σσᵢ")
+    axes[1, 1].set_title("Top singular value concentration")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "init_vs_trained.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    # summary stats
+    print("\nInit → Trained changes:")
+    print(f"  Mean power-law α: {np.mean(results['Init']['slopes']):.3f} → {np.mean(results['Trained']['slopes']):.3f}")
+    print(f"  Mean R²:          {np.mean(results['Init']['r2s']):.3f} → {np.mean(results['Trained']['r2s']):.3f}")
+    print(f"  Mean kurtosis:    {np.mean(results['Init']['kurtoses']):.3f} → {np.mean(results['Trained']['kurtoses']):.3f}")
+    print(f"  Mean top-SV conc: {np.mean(results['Init']['top_sv']):.3f} → {np.mean(results['Trained']['top_sv']):.3f}")
+
+
 # --- registry ---
 
 EXPERIMENTS = {
@@ -1493,6 +1787,8 @@ EXPERIMENTS = {
     "loss_landscape": exp_loss_landscape,
     "repr_sim": exp_representation_similarity,
     "act_fractals": exp_activation_fractals,
+    "grad_fractals": exp_gradient_fractals,
+    "init_vs_trained": exp_init_vs_trained,
 }
 
 

@@ -31,10 +31,15 @@ uv run analyze.py all # run all fractal analyses on saved checkpoints
 - [x] Fractal dimension of SGD trajectory — H=0.753 (D=1.247), persistent fractal path through weight space
 - [x] Loss landscape cross-sections — smooth (H≈1.05), not fractal at this scale/regime
 
-### Phase 4: Attention & Activations (current)
+### Phase 4: Attention & Activations ✅
 - [x] Fractal structure in attention maps — power-law singular values, self-similar across heads
-- [ ] Self-similarity of hidden representations across layers
-- [ ] Fractal dimension of activation distributions
+- [x] Self-similarity of hidden representations across layers — CKA gradient + spectral sim >0.99
+- [x] Fractal dimension of activation distributions — correlation dim grows 0.5D → 16D through network
+
+### Phase 5: Synthesis & Extensions
+- [x] Gradient fractal structure — kurtosis 10–12 in c_attn layers, confirms heavy-tailed SGD theory
+- [x] Compare init vs trained — every metric moves from random → structured/power-law during training
+- [ ] Scale comparison — does a smaller/larger model show the same fractal signatures?
 
 ## Constraints
 - MPS (Apple Silicon) — keep everything single-GPU friendly

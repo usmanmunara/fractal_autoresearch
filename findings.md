@@ -107,9 +107,53 @@
 6. **SGD trajectory is fractal** — Hurst exponent H=0.753, fractal dimension D=1.247, training follows a persistent (non-random) fractal path through weight space
 7. **Loss landscape is smooth** — H≈1.05 near the overfit minimum. Fractal roughness not present at this scale/regime.
 
-### Next Steps
-- Self-similarity of hidden representations across layers
-- Fractal dimension of activation distributions
+---
+
+### Round 5 Experiments (representations & activations)
+
+13. **Representation self-similarity (CKA)** — Measured linear CKA and spectral similarity across all layer pairs.
+    - CKA shows smooth hierarchical gradient: adjacent layers 0.89–0.97, distant layers degrade smoothly (embed↔L5 = 0.39)
+    - Spectral cosine similarity >0.99 for all pairs — the *shape* of representation spectra is nearly identical across all layers, even when representations themselves diverge
+    - All layers follow the same spectral curve on log-log, just shifted = scaled copies
+    - Effective dimensionality grows monotonically: embed (24) → L5 (58) — deeper layers use more dimensions
+    - **Key insight:** Representations are self-similar in spectral structure but gradually diverge in content — exactly what a hierarchical feature extractor should do
+
+14. **Activation distribution fractals** — Analyzed distributions and geometry of activations at every layer.
+    - **Early layers are heavy-tailed:** kurtosis peaks at L1_attn (5.94), then regularizes toward Gaussian in deeper layers. The network is most "wild" early.
+    - Tail exponents peak at L0–L1 (α ≈ 0.23–0.27) then decay — early attention layers have the fattest tails
+    - **Correlation dimension grows through the network:** embed (0.5) → L0 (~5) → L2 (~8.5) → final (15.7, R² = 0.997). The network progressively unfolds the data into higher-dimensional geometric space.
+    - **Key insight:** The network acts as a "dimension expander" — input lives on a ~0.5D manifold, each layer inflates the effective dimensionality, until the final representation occupies ~16D. This progressive unfolding is itself a scale-dependent (fractal-like) process.
+
+---
+
+### Round 6 Experiments (gradients, init vs trained)
+
+15. **Gradient fractal structure** — **Confirms Şimşekli et al.** Gradients are heavily non-Gaussian.
+    - c_attn gradient kurtosis = 10–12 across all layers (Gaussian = 3) — dramatically heavy-tailed
+    - Two-cluster pattern mirrors the weights: c_attn layers wild (K ≈ 10–12), c_proj/c_fc milder (K ≈ 3.6–5.3)
+    - Kurtosis decreases during training — gradient noise "tames" as model converges
+    - Gradient SVD spectra show power-law decay on log-log
+    - **Key insight:** The heavy-tailed gradients explain *why* weights develop power-law spectra — heavy-tailed noise drives the system toward heavy-tailed stationary distributions (Hodgkinson & Mahoney, 2021)
+
+16. **Init vs Trained fractal summary** — Every fractal metric increases during training:
+    - Power-law exponent α: 0.374 → 0.529 (41% increase)
+    - Power-law fit R²: 0.676 → 0.781 — spectra become *more* power-law
+    - Weight kurtosis: 3.0 → 3.8 — weights become heavier-tailed (embedding layers spike to 14.5!)
+    - Top SV concentration: 0.009 → 0.038 (4x) — trained weights are more low-rank/structured
+    - **Key insight:** Training is the process of building fractal structure. Every metric shows monotonic movement away from random (Gaussian/MP) toward structured (power-law/heavy-tailed).
+
+### Cumulative Key Findings
+1. **Power-law spectra** — confirmed (α ≈ 1.1 – 4.0, R² > 0.9)
+2. **Visual fractal structure** — attention correlation matrices show nested block-diagonal patterns
+3. **Cross-layer self-similarity** — layers are near-identical scaled copies of each other (cosine sim >0.99) in both weights AND representations
+4. **Attention vs MLP divergence** — attention layers develop richer fractal structure than MLP layers across all metrics
+5. **Attention maps are power-law too** — not just the weights, but the actual attention patterns follow power laws
+6. **SGD trajectory is fractal** — Hurst exponent H=0.753, fractal dimension D=1.247, persistent fractal path
+7. **Loss landscape is smooth** — H≈1.05 near the overfit minimum
+8. **Activations are heavy-tailed in early layers** — kurtosis up to 5.9, regularizes toward Gaussian in deeper layers
+9. **Correlation dimension grows through network** — 0.5D → 16D, progressive unfolding of data geometry
+10. **Gradients are heavily non-Gaussian** — kurtosis 10–12 in attention layers, confirms heavy-tailed SGD noise theory
+11. **Training builds fractal structure** — every metric moves monotonically from random toward structured/power-law
 
 ---
 
