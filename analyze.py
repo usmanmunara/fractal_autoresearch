@@ -1769,6 +1769,278 @@ def exp_init_vs_trained():
     print(f"  Mean top-SV conc: {np.mean(results['Init']['top_sv']):.3f} → {np.mean(results['Trained']['top_sv']):.3f}")
 
 
+# --- Experiment 18: Scale comparison ---
+
+def exp_scale_comparison():
+    """
+    Compare fractal properties across three model scales:
+    - Small: 3 layers, 96 embd (~1.6M params)
+    - Medium: 6 layers, 192 embd (~12.3M params) — our main model
+    - Large: 8 layers, 256 embd (~26M params)
+
+    Key question: are fractal signatures universal across scales?
+    """
+    import train_scale
+
+    scale_configs = {
+        "small\n(3L/96d)": {
+            "ckpt_dir": os.path.join(os.path.dirname(__file__), "checkpoints_small"),
+            "n_layer": 3, "n_embd": 96, "n_head": 3,
+        },
+        "medium\n(6L/192d)": {
+            "ckpt_dir": CKPT_DIR,
+            "n_layer": N_LAYER, "n_embd": N_EMBD, "n_head": 6,
+        },
+        "large\n(8L/256d)": {
+            "ckpt_dir": os.path.join(os.path.dirname(__file__), "checkpoints_large"),
+            "n_layer": 8, "n_embd": 256, "n_head": 8,
+        },
+    }
+
+    results = {}
+
+    for scale_name, cfg in scale_configs.items():
+        ckpt_dir = cfg["ckpt_dir"]
+        pattern = os.path.join(ckpt_dir, "step_*.pt")
+        ckpts = sorted(glob.glob(pattern))
+        if len(ckpts) < 2:
+            print(f"Skipping {scale_name}: not enough checkpoints in {ckpt_dir}")
+            continue
+
+        print(f"\nAnalyzing {scale_name} ({len(ckpts)} checkpoints)...")
+
+        # load init and final
+        if scale_name.startswith("medium"):
+            init_model = load_checkpoint(ckpts[0])
+            final_model = load_checkpoint(ckpts[-1])
+        else:
+            init_model = train_scale.GPT(cfg["n_layer"], cfg["n_embd"], cfg["n_head"])
+            init_model.load_state_dict(torch.load(ckpts[0], map_location="cpu", weights_only=True))
+            init_model.eval()
+            final_model = train_scale.GPT(cfg["n_layer"], cfg["n_embd"], cfg["n_head"])
+            final_model.load_state_dict(torch.load(ckpts[-1], map_location="cpu", weights_only=True))
+            final_model.eval()
+
+        # --- Metric 1: Power-law exponents ---
+        init_alphas = []
+        trained_alphas = []
+        trained_r2s = []
+
+        for model, alpha_list in [(init_model, init_alphas), (final_model, trained_alphas)]:
+            for name, param in model.named_parameters():
+                if param.ndim != 2 or param.shape[0] < 10:
+                    continue
+                w = param.detach().numpy()
+                sv = np.linalg.svd(w, compute_uv=False)
+                sv = sv[sv > 1e-10]
+                ranks = np.arange(1, len(sv) + 1)
+                slope, _, r, _, _ = stats.linregress(np.log(ranks), np.log(sv))
+                alpha_list.append(-slope)
+                if model is final_model:
+                    trained_r2s.append(r**2)
+
+        # --- Metric 2: Weight kurtosis ---
+        init_kurts = []
+        trained_kurts = []
+        for model, kurt_list in [(init_model, init_kurts), (final_model, trained_kurts)]:
+            for name, param in model.named_parameters():
+                if param.ndim != 2 or param.shape[0] < 10:
+                    continue
+                kurt_list.append(float(stats.kurtosis(param.detach().numpy().flatten(), fisher=False)))
+
+        # --- Metric 3: Cross-layer spectral similarity ---
+        spectra = []
+        for name, param in final_model.named_parameters():
+            if param.ndim != 2 or param.shape[0] < 10:
+                continue
+            sv = np.linalg.svd(param.detach().numpy(), compute_uv=False)
+            sv = sv / sv.sum()
+            spectra.append(sv)
+
+        cross_sims = []
+        for i in range(len(spectra)):
+            for j in range(i+1, len(spectra)):
+                min_len = min(len(spectra[i]), len(spectra[j]))
+                a, b = spectra[i][:min_len], spectra[j][:min_len]
+                sim = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+                cross_sims.append(sim)
+
+        # --- Metric 4: Top SV concentration ---
+        init_conc = []
+        trained_conc = []
+        for model, conc_list in [(init_model, init_conc), (final_model, trained_conc)]:
+            for name, param in model.named_parameters():
+                if param.ndim != 2 or param.shape[0] < 10:
+                    continue
+                sv = np.linalg.svd(param.detach().numpy(), compute_uv=False)
+                conc_list.append(sv[0] / sv.sum())
+
+        # --- Metric 5: SGD trajectory Hurst exponent ---
+        hurst = None
+        if len(ckpts) >= 4:
+            trajectory = []
+            for ckpt_path in ckpts:
+                state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                params = []
+                for key in sorted(state.keys()):
+                    params.append(state[key].numpy().flatten())
+                trajectory.append(np.concatenate(params))
+
+            trajectory = np.array(trajectory)
+            max_scale = len(ckpts) // 2
+            scales = list(range(1, max_scale + 1))
+            mean_disps = []
+            for k in scales:
+                dists = []
+                for i in range(len(trajectory) - k):
+                    d = np.linalg.norm(trajectory[i + k] - trajectory[i])
+                    dists.append(d)
+                mean_disps.append(np.mean(dists))
+
+            if len(scales) >= 3:
+                H, _, r, _, _ = stats.linregress(np.log(scales), np.log(mean_disps))
+                hurst = (H, r**2)
+
+        n_params = sum(p.numel() for p in final_model.parameters())
+        results[scale_name] = {
+            "n_params": n_params,
+            "init_alpha_mean": np.mean(init_alphas),
+            "trained_alpha_mean": np.mean(trained_alphas),
+            "trained_r2_mean": np.mean(trained_r2s),
+            "init_kurt_mean": np.mean(init_kurts),
+            "trained_kurt_mean": np.mean(trained_kurts),
+            "cross_sim_mean": np.mean(cross_sims) if cross_sims else 0,
+            "init_conc_mean": np.mean(init_conc),
+            "trained_conc_mean": np.mean(trained_conc),
+            "hurst": hurst,
+        }
+
+    if len(results) < 2:
+        print("Need at least 2 scales to compare. Train more models first.")
+        return
+
+    # --- Plot ---
+    scale_names = list(results.keys())
+    n_scales = len(scale_names)
+    x_pos = np.arange(n_scales)
+    width = 0.35
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Fractal Properties Across Model Scales\nAre fractal signatures universal?", fontsize=14)
+
+    colors_init = "lightgray"
+    colors_trained = ["#2196F3", "#4CAF50", "#FF5722"][:n_scales]
+
+    # 1. Power-law exponents
+    init_vals = [results[s]["init_alpha_mean"] for s in scale_names]
+    trained_vals = [results[s]["trained_alpha_mean"] for s in scale_names]
+    axes[0, 0].bar(x_pos - width/2, init_vals, width, color=colors_init, label="Init")
+    bars = axes[0, 0].bar(x_pos + width/2, trained_vals, width, color=colors_trained, label="Trained")
+    axes[0, 0].set_xticks(x_pos)
+    axes[0, 0].set_xticklabels(scale_names, fontsize=8)
+    axes[0, 0].set_ylabel("Mean α")
+    axes[0, 0].set_title("Power-law exponent α")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3, axis="y")
+
+    # 2. R² of power-law fit
+    r2_vals = [results[s]["trained_r2_mean"] for s in scale_names]
+    axes[0, 1].bar(x_pos, r2_vals, color=colors_trained)
+    axes[0, 1].set_xticks(x_pos)
+    axes[0, 1].set_xticklabels(scale_names, fontsize=8)
+    axes[0, 1].set_ylabel("Mean R²")
+    axes[0, 1].set_title("Power-law fit quality (trained)")
+    axes[0, 1].set_ylim(0.5, 1.0)
+    axes[0, 1].grid(True, alpha=0.3, axis="y")
+
+    # 3. Weight kurtosis
+    init_vals = [results[s]["init_kurt_mean"] for s in scale_names]
+    trained_vals = [results[s]["trained_kurt_mean"] for s in scale_names]
+    axes[0, 2].bar(x_pos - width/2, init_vals, width, color=colors_init, label="Init")
+    axes[0, 2].bar(x_pos + width/2, trained_vals, width, color=colors_trained, label="Trained")
+    axes[0, 2].axhline(y=3, color="black", linestyle="--", alpha=0.5)
+    axes[0, 2].set_xticks(x_pos)
+    axes[0, 2].set_xticklabels(scale_names, fontsize=8)
+    axes[0, 2].set_ylabel("Mean kurtosis")
+    axes[0, 2].set_title("Weight kurtosis (Gaussian=3)")
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3, axis="y")
+
+    # 4. Cross-layer similarity
+    sim_vals = [results[s]["cross_sim_mean"] for s in scale_names]
+    axes[1, 0].bar(x_pos, sim_vals, color=colors_trained)
+    axes[1, 0].set_xticks(x_pos)
+    axes[1, 0].set_xticklabels(scale_names, fontsize=8)
+    axes[1, 0].set_ylabel("Mean cosine similarity")
+    axes[1, 0].set_title("Cross-layer spectral similarity")
+    axes[1, 0].set_ylim(0.8, 1.0)
+    axes[1, 0].grid(True, alpha=0.3, axis="y")
+
+    # 5. Top SV concentration
+    init_vals = [results[s]["init_conc_mean"] for s in scale_names]
+    trained_vals = [results[s]["trained_conc_mean"] for s in scale_names]
+    axes[1, 1].bar(x_pos - width/2, init_vals, width, color=colors_init, label="Init")
+    axes[1, 1].bar(x_pos + width/2, trained_vals, width, color=colors_trained, label="Trained")
+    axes[1, 1].set_xticks(x_pos)
+    axes[1, 1].set_xticklabels(scale_names, fontsize=8)
+    axes[1, 1].set_ylabel("σ₁ / Σσᵢ")
+    axes[1, 1].set_title("Top SV concentration")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3, axis="y")
+
+    # 6. Hurst exponent
+    hurst_vals = []
+    hurst_labels = []
+    hurst_colors = []
+    for i, s in enumerate(scale_names):
+        if results[s]["hurst"] is not None:
+            H, r2 = results[s]["hurst"]
+            hurst_vals.append(H)
+            hurst_labels.append(f"{s}\nH={H:.3f}\nR²={r2:.3f}")
+            hurst_colors.append(colors_trained[i])
+    if hurst_vals:
+        axes[1, 2].bar(range(len(hurst_vals)), hurst_vals, color=hurst_colors)
+        axes[1, 2].axhline(y=0.5, color="black", linestyle="--", alpha=0.5, label="Random walk")
+        axes[1, 2].set_xticks(range(len(hurst_vals)))
+        axes[1, 2].set_xticklabels(hurst_labels, fontsize=7)
+        axes[1, 2].set_ylabel("Hurst exponent H")
+        axes[1, 2].set_title("SGD trajectory Hurst exponent")
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "scale_comparison.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved: {path}")
+
+    # print summary table
+    print(f"\n{'='*80}")
+    print(f"SCALE COMPARISON SUMMARY")
+    print(f"{'='*80}")
+    print(f"{'Metric':<30} ", end="")
+    for s in scale_names:
+        print(f"{s:>15} ", end="")
+    print()
+    print("-" * 80)
+
+    metrics = [
+        ("Parameters", lambda s: f"{results[s]['n_params']/1e6:.1f}M"),
+        ("α (init → trained)", lambda s: f"{results[s]['init_alpha_mean']:.3f}→{results[s]['trained_alpha_mean']:.3f}"),
+        ("R² (trained)", lambda s: f"{results[s]['trained_r2_mean']:.3f}"),
+        ("Kurtosis (init → trained)", lambda s: f"{results[s]['init_kurt_mean']:.2f}→{results[s]['trained_kurt_mean']:.2f}"),
+        ("Cross-layer sim", lambda s: f"{results[s]['cross_sim_mean']:.4f}"),
+        ("Top SV conc (init → trained)", lambda s: f"{results[s]['init_conc_mean']:.3f}→{results[s]['trained_conc_mean']:.3f}"),
+        ("Hurst exponent", lambda s: f"{results[s]['hurst'][0]:.3f}" if results[s]['hurst'] else "N/A"),
+    ]
+
+    for metric_name, fmt_fn in metrics:
+        print(f"{metric_name:<30} ", end="")
+        for s in scale_names:
+            print(f"{fmt_fn(s):>15} ", end="")
+        print()
+
+
 # --- registry ---
 
 EXPERIMENTS = {
@@ -1789,6 +2061,7 @@ EXPERIMENTS = {
     "act_fractals": exp_activation_fractals,
     "grad_fractals": exp_gradient_fractals,
     "init_vs_trained": exp_init_vs_trained,
+    "scale": exp_scale_comparison,
 }
 
 

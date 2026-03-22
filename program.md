@@ -39,7 +39,7 @@ uv run analyze.py all # run all fractal analyses on saved checkpoints
 ### Phase 5: Synthesis & Extensions
 - [x] Gradient fractal structure — kurtosis 10–12 in c_attn layers, confirms heavy-tailed SGD theory
 - [x] Compare init vs trained — every metric moves from random → structured/power-law during training
-- [ ] Scale comparison — does a smaller/larger model show the same fractal signatures?
+- [x] Scale comparison — YES, all fractal signatures universal across 5M/12M/19M. Hurst ≈ 0.76 is near-constant.
 
 ## Constraints
 - MPS (Apple Silicon) — keep everything single-GPU friendly
