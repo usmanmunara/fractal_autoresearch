@@ -12,4 +12,4 @@ wheels/
 # Data and checkpoints (regenerable)
 data/
 checkpoints/
-plots/
+# plots/ — tracked so README images render on GitHub

@@ -27,7 +27,7 @@
 \title{\textbf{Neural Networks Are Fractals:}\\
 Emergent Self-Similar Structure in Weights,\\Activations, and Training Dynamics}
 
-\author{Usman Munara}
+\author{Usman}
 
 \date{\today}
 
@@ -36,25 +36,25 @@ Emergent Self-Similar Structure in Weights,\\Activations, and Training Dynamics}
 \maketitle
 
 \begin{abstract}
-We present a systematic empirical study of fractal properties in neural networks, training a GPT-class transformer at three scales (5M, 12M, 19M parameters) on natural language data. Through 18 experiments spanning weight spectra, attention structure, hidden representations, gradient distributions, optimization trajectories, and loss landscapes, we document 12 distinct fractal signatures that emerge during training. Key findings include: (1) weight matrices develop heavy-tailed singular value distributions with power-law exponents $\alpha \approx 1.1$--$4.0$ ($R^2 > 0.9$), consistent with Martin \& Mahoney's self-regularization theory; (2) attention weight correlation matrices develop nested block-diagonal structure---a visual hallmark of fractal geometry; (3) cross-layer spectral similarity exceeds 0.99, indicating layers are scaled copies of each other; (4) the SGD trajectory through weight space has Hurst exponent $H \approx 0.76$ and fractal dimension $D \approx 1.24$; (5) all fractal signatures are universal across model scales, with the Hurst exponent remarkably stable ($0.755$--$0.763$). These results demonstrate that training is not merely optimization but the spontaneous construction of fractal geometry, and that the mathematical framework of fractals provides a natural language for describing the internal structure of neural networks.
+We present a systematic empirical study of fractal properties in neural networks, training a GPT-class transformer at three scales (5M, 12M, 19M parameters) on natural language data. Through 18 experiments spanning weight spectra, attention structure, hidden representations, gradient distributions, optimization trajectories, and loss landscapes, we document 12 distinct fractal signatures that emerge during training. Key findings include: (1) weight matrices develop heavy-tailed singular value distributions with power-law exponents $\alpha \approx 1.1$--$4.0$ ($R^2 > 0.9$), consistent with Martin \& Mahoney's self-regularization theory; (2) attention weight correlation matrices develop nested block-diagonal structure consistent with hierarchical organization; (3) cross-layer spectral similarity exceeds 0.99; (4) the SGD trajectory through weight space has Hurst exponent $H \approx 0.76$ and fractal dimension $D \approx 1.24$; (5) these signatures are consistent across the three tested model scales, with the Hurst exponent stable ($0.755$--$0.763$). These results suggest that the mathematical framework of fractals provides a useful language for describing internal neural network structure.
 \end{abstract}
 
 \section{Introduction}
 
 The internal structure of trained neural networks remains poorly understood. While we can measure loss, accuracy, and generalization, the geometric and statistical properties of learned weight matrices---and the process by which they are learned---are less well characterized. Recent work in random matrix theory has shown that trained weight matrices depart from the Marchenko--Pastur distribution expected of random matrices \citep{marchenko1967distribution}, developing instead heavy-tailed singular value distributions that follow power laws \citep{martin2019implicit, martin2021predicting}. Separately, work on SGD dynamics has shown that gradient noise is heavy-tailed rather than Gaussian \citep{simsekli2019tail}, with multiplicative noise structure that drives weights toward heavy-tailed stationary distributions \citep{hodgkinson2021multiplicative}.
 
-These observations suggest a unifying framework: \emph{neural networks are fractal objects}, and training is the process of building fractal structure. In this paper, we test this hypothesis systematically. We train GPT-class transformers at three scales and probe their weights, activations, attention patterns, gradients, and optimization trajectories for fractal signatures---power-law spectra, self-similarity across scales, and fractal geometry in parameter space.
+These observations motivate a unifying framework: neural networks may exhibit fractal-like organization, and training may progressively build this structure. In this paper, we test this hypothesis systematically. We train GPT-class transformers at three scales and probe their weights, activations, attention patterns, gradients, and optimization trajectories for fractal signatures---power-law spectra, self-similarity across scales, and geometry in parameter space.
 
-We find that fractal structure is pervasive. Every metric we measure moves monotonically from random (Gaussian, Marchenko--Pastur) toward structured (power-law, heavy-tailed) during training. Layers become scaled copies of each other. Attention weight correlations develop nested block-diagonal patterns. The SGD trajectory is a fractal curve with near-universal Hurst exponent. And all of these properties hold across model scales from 5M to 19M parameters.
+We find fractal-like structure across many probes. Most metrics move from random-like (Gaussian, Marchenko--Pastur) toward more structured (power-law, heavy-tailed) behavior during training. Attention weight correlations develop nested block-diagonal patterns, and the SGD trajectory shows stable scaling behavior. These properties are consistent across model scales from 5M to 19M parameters.
 
 \subsection{Contributions}
 
 \begin{enumerate}[leftmargin=*]
     \item A comprehensive empirical catalog of 12 fractal signatures in neural networks, spanning weights, activations, gradients, attention patterns, and optimization dynamics.
-    \item Evidence that cross-layer spectral self-similarity \emph{increases} with model scale---larger models are more fractal.
-    \item Measurement of the SGD trajectory's Hurst exponent as a near-universal constant ($H \approx 0.76$) across architectures.
-    \item A causal chain connecting heavy-tailed gradients to heavy-tailed weight spectra to fractal attention structure.
-    \item Demonstration that the loss landscape near an overfit minimum is smooth, not fractal---a boundary condition for fractal theories.
+    \item Evidence that cross-layer spectral self-similarity \emph{increases} with model scale in our setting.
+    \item Measurement of the SGD trajectory's Hurst exponent as a stable statistic ($H \approx 0.76$) across our tested configurations.
+    \item A testable causal hypothesis connecting heavy-tailed gradients, heavy-tailed weight spectra, and structured attention correlations.
+    \item Evidence that the local loss landscape near an overfit minimum is smooth, not fractal-like---a boundary condition for fractal theories.
 \end{enumerate}
 
 \section{Background}
@@ -63,7 +63,7 @@ We find that fractal structure is pervasive. Every metric we measure moves monot
 
 A fractal is an object that exhibits self-similarity across scales. The mathematical signature of fractal structure is the \emph{power law}: a quantity $f(x)$ that scales as $f(x) \sim x^{-\alpha}$ for some exponent $\alpha$. On a log-log plot, power laws appear as straight lines. The exponent $\alpha$ characterizes the ``roughness'' or complexity of the fractal---smaller $\alpha$ indicates heavier tails and richer structure.
 
-The \emph{Hurst exponent} $H$ characterizes the fractal dimension of time series and trajectories. For a displacement process, $\langle|X(t+\tau) - X(t)|\rangle \sim \tau^H$. A Hurst exponent $H = 0.5$ corresponds to Brownian motion (random walk); $H > 0.5$ indicates persistent (trending) behavior; $H < 0.5$ indicates anti-persistent behavior. The fractal dimension of the trajectory is $D = 2 - H$.
+The \emph{Hurst exponent} $H$ characterizes scaling behavior in time series and trajectories. For a displacement process, $\langle|X(t+\tau) - X(t)|\rangle \sim \tau^H$. A Hurst exponent $H = 0.5$ corresponds to Brownian motion (random walk); $H > 0.5$ indicates persistent (trending) behavior; $H < 0.5$ indicates anti-persistent behavior. For self-affine curves with $0 < H < 1$, one commonly uses $D = 2 - H$ as an effective fractal-dimension proxy.
 
 \subsection{Random Matrix Theory and Marchenko--Pastur}
 
@@ -119,7 +119,7 @@ We implement 18 analysis experiments organized in five phases:
 
 \subsection{Power-Law Singular Value Spectra}
 
-We compute the singular value decomposition of every weight matrix at each checkpoint and fit power laws on log-log plots via linear regression. Figure~\ref{fig:spectra} shows representative results.
+We compute the singular value decomposition of every weight matrix at each checkpoint and fit power laws on log-log plots via linear regression. This is a descriptive estimator; more rigorous model comparison methods are available \citep{clauset2009powerlaw, alstott2014powerlaw}. Figure~\ref{fig:spectra} shows representative results.
 
 At initialization, singular value distributions follow the Marchenko--Pastur law (curved on log-log). During training, they straighten into power laws. By step 10,000, most layers achieve exponents $\alpha \approx 1.1$--$1.6$ with $R^2 > 0.9$. Attention projection layers (\texttt{c\_proj}) develop steeper tails ($\alpha \approx 3.8$--$4.0$), at the boundary of the $[1.5, 3.5]$ range predicted by \citet{martin2021predicting}---consistent with our small, overtrained model.
 
@@ -150,7 +150,7 @@ We compute the Pearson correlation matrix of attention weight rows (\texttt{c\_a
 
 At initialization, correlation matrices show no structure (uniform noise). After training, they develop striking \textbf{nested block-diagonal structure}---blocks within blocks within blocks (Figure~\ref{fig:attention}). This hierarchical clustering of neurons is the visual signature of fractal organization. Layers L2--L5 show the strongest patterns; earlier layers develop weaker structure.
 
-This is direct visual evidence that training organizes neurons into a self-similar hierarchy, where groups of correlated neurons contain subgroups of more tightly correlated neurons, recursively.
+This is visual evidence consistent with hierarchical organization, where groups of correlated neurons contain subgroups of more tightly correlated neurons.
 
 \begin{figure}[h]
 \centering
@@ -215,7 +215,7 @@ We compute gradients on batches of data at multiple training stages and analyze 
 
 A two-cluster pattern mirrors the weight spectra: \texttt{c\_attn} gradients are wildly heavy-tailed ($K \approx 10$--$12$), while \texttt{c\_proj} and \texttt{c\_fc} gradients are milder ($K \approx 3.6$--$5.3$). Kurtosis decreases during training as the model converges, but remains above Gaussian throughout.
 
-This establishes a causal chain: heavy-tailed gradient noise $\to$ heavy-tailed weight distributions $\to$ power-law singular value spectra $\to$ fractal attention structure, consistent with the theoretical framework of \citet{hodgkinson2021multiplicative}.
+This pattern is consistent with (but does not by itself prove) a causal chain: heavy-tailed gradient noise $\to$ heavy-tailed weight distributions $\to$ power-law singular value spectra $\to$ structured attention correlations, in line with \citet{hodgkinson2021multiplicative}.
 
 \begin{figure}[h]
 \centering
@@ -240,7 +240,7 @@ We feed data through the trained model and analyze activation distributions and 
 
 \paragraph{Heavy tails in early layers.} Activation kurtosis peaks at L1 attention ($K = 5.94$) and regularizes toward Gaussian in deeper layers. The network is most ``wild'' early and progressively smooths.
 
-\paragraph{Correlation dimension.} Using the Grassberger--Procaccia algorithm on token-level activation vectors, we estimate the correlation dimension at each layer. It grows monotonically: embedding (0.5) $\to$ L0 ($\sim$5) $\to$ L2 ($\sim$8.5) $\to$ final layer (15.7). The network acts as a \emph{dimension expander}, progressively unfolding the data from a $\sim$0.5-dimensional manifold into $\sim$16-dimensional representation space (Figure~\ref{fig:activations}).
+\paragraph{Correlation dimension.} Using the Grassberger--Procaccia algorithm on token-level activation vectors, we estimate the correlation dimension at each layer. It grows monotonically: embedding (0.5) $\to$ L0 ($\sim$5) $\to$ L2 ($\sim$8.5) $\to$ final layer (15.7). This is directionally consistent with intrinsic-dimension analyses in prior work \citep{ansuini2019intrinsic, valeriani2023geometry}, suggesting the network acts as a \emph{dimension expander}, progressively unfolding the data from a $\sim$0.5-dimensional manifold into $\sim$16-dimensional representation space (Figure~\ref{fig:activations}).
 
 \begin{figure}[h]
 \centering
@@ -251,9 +251,9 @@ We feed data through the trained model and analyze activation distributions and 
 
 \subsection{Loss Landscape}
 
-We take 1D and 2D cross-sections of the loss landscape around the trained minimum using random orthogonal directions in parameter space. The Hurst exponent of the 1D cross-sections is $H \approx 1.05$ ($R^2 = 0.9998$)---nearly differentiable, indicating a \textbf{smooth, non-fractal} landscape.
+We take 1D and 2D cross-sections of the loss landscape around the trained minimum using random orthogonal directions in parameter space. The Hurst estimate for the 1D cross-sections is $H \approx 1.05$ ($R^2 = 0.9998$), indicating a very smooth curve in this local neighborhood.
 
-The 2D surface is a smooth tilted bowl with elliptical contours (Figure~\ref{fig:landscape}). This is consistent with \citet{li2018visualizing}, who showed that loss surface complexity increases with model scale. Our small, overfit model sits in a sharp, well-defined minimum where fractal roughness is absent.
+The 2D surface is a smooth tilted bowl with elliptical contours (Figure~\ref{fig:landscape}). This is consistent with loss-landscape results in \citet{li2018visualizing, garipov2018modeconnectivity, ghorbani2019hessian}. Our small, overfit model sits in a sharp, well-defined minimum where local roughness is limited.
 
 \begin{figure}[h]
 \centering
@@ -277,13 +277,15 @@ The 2D surface is a smooth tilted bowl with elliptical contours (Figure~\ref{fig
 To summarize the effect of training on fractal structure, we compare four metrics across all weight matrices at initialization vs.\ after training (Figure~\ref{fig:init_trained}).
 
 \begin{itemize}[leftmargin=*]
-    \item Power-law exponent $\alpha$: $0.374 \to 0.529$ (41\% increase)
+    \item Mean spectral slope proxy $\beta$: $0.374 \to 0.529$ (41\% increase)
     \item Power-law fit $R^2$: $0.676 \to 0.781$
     \item Weight kurtosis: $3.00 \to 3.84$ (departure from Gaussian)
     \item Top singular value concentration $\sigma_1 / \sum \sigma_i$: $0.009 \to 0.038$ (4$\times$ increase)
 \end{itemize}
 
-Every metric moves monotonically from random toward structured. Training is the process of building fractal geometry.
+Here, $\beta$ is a global aggregated slope metric and is not directly comparable to the per-layer heavy-tail exponent $\alpha$ reported in Section~\ref{fig:spectra}.
+
+Most metrics move from random-like toward structured behavior over training.
 
 \begin{figure}[h]
 \centering
@@ -298,13 +300,13 @@ We repeat the key analyses across three model scales (Table~\ref{tab:scale}).
 
 \begin{table}[h]
 \centering
-\caption{Fractal metrics across model scales. All signatures are universal.}
+\caption{Fractal metrics across model scales. Signatures are consistent across tested scales.}
 \label{tab:scale}
 \begin{tabular}{lccc}
 \toprule
 \textbf{Metric} & \textbf{Small (5.2M)} & \textbf{Medium (12.3M)} & \textbf{Large (19.2M)} \\
 \midrule
-$\alpha$ (init $\to$ trained) & $0.387 \to 0.620$ & $0.374 \to 0.529$ & $0.370 \to 0.507$ \\
+$\beta$ (init $\to$ trained) & $0.387 \to 0.620$ & $0.374 \to 0.529$ & $0.370 \to 0.507$ \\
 $R^2$ (trained) & 0.798 & 0.781 & 0.774 \\
 Kurtosis (init $\to$ trained) & $3.02 \to 4.82$ & $3.00 \to 3.84$ & $3.00 \to 3.89$ \\
 Cross-layer similarity & 0.845 & 0.902 & 0.922 \\
@@ -316,9 +318,9 @@ Hurst exponent $H$ & 0.755 & 0.757 & 0.763 \\
 
 Key observations:
 \begin{itemize}[leftmargin=*]
-    \item Every fractal signature appears at all three scales.
-    \item Cross-layer similarity \emph{increases} with scale ($0.845 \to 0.922$)---larger models are more self-similar.
-    \item The Hurst exponent is remarkably stable: $0.755$, $0.757$, $0.763$. The fractal dimension of the SGD trajectory ($D \approx 1.24$) appears to be a near-universal constant.
+    \item Similar fractal-like signatures appear at all three tested scales.
+    \item Cross-layer similarity \emph{increases} with scale ($0.845 \to 0.922$) in this dataset/configuration.
+    \item The Hurst exponent is stable in this setup: $0.755$, $0.757$, $0.763$.
     \item Smaller models develop higher kurtosis and steeper power laws---they ``overfit harder'' into more extreme fractal structure.
 \end{itemize}
 
@@ -326,13 +328,13 @@ Key observations:
 
 \subsection{A Causal Chain}
 
-Our results suggest a causal chain underlying fractal structure in neural networks:
+Our results suggest a causal hypothesis underlying fractal-like structure in neural networks:
 
 \begin{enumerate}[leftmargin=*]
-    \item \textbf{SGD gradient noise is heavy-tailed} (kurtosis 10--12 in attention layers), consistent with $\alpha$-stable L\'{e}vy noise \citep{simsekli2019tail}.
-    \item \textbf{Heavy-tailed noise drives weights toward heavy-tailed distributions} \citep{hodgkinson2021multiplicative}, producing the power-law singular value spectra we observe ($\alpha \approx 1.1$--$4.0$).
-    \item \textbf{Power-law weight structure creates self-similar correlations}, manifesting as nested block-diagonal attention patterns and cross-layer spectral similarity $> 0.99$.
-    \item \textbf{The optimization trajectory inherits fractal geometry} from the heavy-tailed dynamics, with Hurst exponent $H \approx 0.76$ across scales.
+    \item \textbf{SGD gradient noise is strongly non-Gaussian} (kurtosis 10--12 in attention layers), consistent with heavy-tailed noise models \citep{simsekli2019tail}.
+    \item \textbf{Heavy-tailed noise may drive weights toward heavy-tailed distributions} \citep{hodgkinson2021multiplicative}, producing the power-law singular value spectra we observe ($\alpha \approx 1.1$--$4.0$).
+    \item \textbf{Power-law weight structure may co-occur with self-similar correlations}, manifesting as nested block-diagonal attention patterns and high cross-layer spectral similarity.
+    \item \textbf{The optimization trajectory exhibits stable scaling} with Hurst exponent $H \approx 0.76$ across tested scales.
 \end{enumerate}
 
 \subsection{Why Larger Models Are More Fractal}
@@ -341,24 +343,29 @@ Cross-layer similarity increases with model scale ($0.845 \to 0.922$). We hypoth
 
 \subsection{The Smooth Loss Landscape}
 
-The loss landscape near our overfit minimum is smooth ($H \approx 1.05$), not fractal. This is a boundary condition for fractal theories of optimization: fractal roughness may characterize saddle points, flat regions, and the broad landscape, but not the sharp minima of small overfit models. This is consistent with \citet{li2018visualizing}, who showed landscape complexity increases with model scale.
+The loss landscape near our overfit minimum is smooth ($H \approx 1.05$). We treat this as a local result around one solution, not a global statement about the full landscape. This is consistent with \citet{li2018visualizing}, and compatible with mode-connectivity and curvature results \citep{garipov2018modeconnectivity, ghorbani2019hessian}.
 
 \subsection{Limitations}
 
 \begin{itemize}[leftmargin=*]
     \item \textbf{Scale}: Our largest model is 19M parameters---small by modern standards. The universality of fractal signatures at billion-parameter scale remains an open question.
     \item \textbf{Data}: All models are trained on a single small dataset (Tiny Shakespeare). Different data distributions may produce different fractal characteristics.
+    \item \textbf{Replication}: Results are reported from single-run trajectories per configuration; seed-to-seed variance is not yet quantified.
     \item \textbf{Multifractal analysis}: Our attempt at multifractal spectrum estimation was unsuccessful due to the difficulty of applying 1D methods to 2D weight matrices. Proper 2D MFDFA or wavelet leader methods would strengthen these results.
+    \item \textbf{Tail fitting methodology}: Our power-law fits use linear regression on log-log plots; future work should use principled tail-model selection and goodness-of-fit testing \citep{clauset2009powerlaw, alstott2014powerlaw}.
+    \item \textbf{Spectral confounds}: Layer shape (aspect ratio) and random-matrix bulk effects can bias heavy-tail interpretation \citep{thamm2022randommatrix, staats2023boundary, hu2025eigenspectrum}.
+    \item \textbf{Estimator sensitivity}: Hurst and correlation-dimension estimates depend on scale ranges, sample size, and preprocessing choices; synthetic-calibration tests are needed.
+    \item \textbf{Missing controls}: We do not yet include controls such as label-randomization, checkpoint shuffling, or permutation baselines for similarity metrics.
     \item \textbf{Overfitting}: All models heavily overfit, which may amplify certain fractal signatures. The relationship between generalization and fractal structure deserves further study.
 \end{itemize}
 
 \section{Conclusion}
 
-We have presented a comprehensive empirical study demonstrating that fractal structure is a fundamental property of trained neural networks. Through 18 experiments across three model scales, we documented 12 distinct fractal signatures spanning weights, activations, gradients, attention patterns, and optimization dynamics.
+We have presented a comprehensive empirical study showing strong evidence of fractal-like structure in trained neural networks. Through 18 experiments across three model scales, we documented 12 signatures spanning weights, activations, gradients, attention patterns, and optimization dynamics.
 
-The central finding is that \textbf{training is the process of building fractal geometry}. Every metric we measure---power-law exponents, kurtosis, spectral similarity, singular value concentration---moves monotonically from random toward structured during training. The resulting fractal organization is not an artifact of one architecture or one scale: it appears universally, with the SGD Hurst exponent ($H \approx 0.76$) serving as a near-universal constant.
+The central finding is that training appears to progressively build structured, often fractal-like organization. Many metrics we measure---power-law exponents, kurtosis, spectral similarity, singular value concentration---move from random-like toward structured during training. In our controlled setting, this pattern is reproducible across three scales, with the SGD Hurst exponent ($H \approx 0.76$) notably stable.
 
-These results suggest that the mathematics of fractals---power laws, self-similarity, heavy-tailed distributions---provides a natural language for describing the internal structure of neural networks. Understanding why training builds fractals may be key to understanding why neural networks work at all.
+These results suggest that the mathematics of fractals---power laws, self-similarity, heavy-tailed distributions---is a useful language for describing internal neural network structure. Extending this analysis to larger models, broader datasets, and stricter statistical tests is the next step toward determining how general these phenomena are.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
