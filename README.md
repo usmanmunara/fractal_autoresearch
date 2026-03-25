@@ -172,6 +172,4 @@ fractal-agents/
 
 10. **Yang & Salman (2019).** A Mean Field Theory of Batch Normalization. *ICLR 2019*. [arXiv:1902.08129](https://arxiv.org/abs/1902.08129)
 
-## License
 
-MIT
