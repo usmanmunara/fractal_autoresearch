@@ -8,6 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+.env.*
 
 # Data and checkpoints (regenerable)
 data/

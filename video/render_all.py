@@ -9,7 +9,7 @@ Usage:
 
 import subprocess
 import sys
-import os
+import shutil
 from pathlib import Path
 
 SCENES = [
@@ -32,6 +32,7 @@ ROOT = Path(__file__).parent.parent
 def main():
     quality = "-ql"
     quality_dir = "480p15"
+    skip_stitch = "--no-stitch" in sys.argv
     if "--hq" in sys.argv:
         quality = "-qh"
         quality_dir = "1080p60"
@@ -57,21 +58,37 @@ def main():
             sys.exit(1)
         print(f"  Done.")
 
+    if skip_stitch:
+        print("\nSkipping stitch (--no-stitch).")
+        return
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        print("\nSkipping stitch: ffmpeg not found in PATH.")
+        print("Install ffmpeg, then rerun without --no-stitch to create a full video.")
+        return
+
     # Create concat file list for ffmpeg
     concat_file = media_dir / "concat_list.txt"
+    rendered_count = 0
     with open(concat_file, "w") as f:
         for scene in SCENES:
             mp4 = media_dir / f"{scene}.mp4"
             if mp4.exists():
                 f.write(f"file '{mp4.name}'\n")
+                rendered_count += 1
             else:
                 print(f"WARNING: {mp4} not found, skipping")
+
+    if rendered_count == 0:
+        print("\nNo rendered scene files found. Nothing to stitch.")
+        return
 
     # Stitch with ffmpeg
     output = media_dir / "NeuralNetworksAreFractals_FULL.mp4"
     print(f"\nStitching into {output}...")
     result = subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        [ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
          "-i", str(concat_file), "-c", "copy", str(output)],
         capture_output=True, text=True,
     )

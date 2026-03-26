@@ -68,6 +68,59 @@ def source_tag(text, scene):
     return tag
 
 
+def downsample_square_mean(matrix, target_size):
+    """Downsample a square matrix with block means to preserve structure."""
+    if target_size is None:
+        return matrix
+    n = matrix.shape[0]
+    if n <= target_size:
+        return matrix
+
+    bins = np.linspace(0, n, target_size + 1).astype(int)
+    out = np.zeros((target_size, target_size), dtype=np.float32)
+    for i in range(target_size):
+        r0, r1 = bins[i], bins[i + 1]
+        if r1 <= r0:
+            r1 = min(r0 + 1, n)
+        for j in range(target_size):
+            c0, c1 = bins[j], bins[j + 1]
+            if c1 <= c0:
+                c1 = min(c0 + 1, n)
+            out[i, j] = float(matrix[r0:r1, c0:c1].mean())
+    return out
+
+
+def corr_color(value, vmin=-0.3, vmax=0.3):
+    """Map correlation values to a diverging palette centered at zero."""
+    value = float(np.clip(value, vmin, vmax))
+    if value < 0:
+        t = (value - vmin) / max(1e-8, (0 - vmin))
+        return interpolate_color(ManimColor(STEEL), ManimColor(BG_COLOR), t)
+    t = value / max(1e-8, vmax)
+    return interpolate_color(ManimColor(BG_COLOR), ManimColor(GOLD), t)
+
+
+def corr_legend(width=2.2, height=0.18, vmin=-0.3, vmax=0.3, title="correlation"):
+    """Small horizontal legend for correlation heatmaps."""
+    steps = 24
+    bar = VGroup()
+    for i, val in enumerate(np.linspace(vmin, vmax, steps)):
+        rect = Rectangle(
+            width=width / steps, height=height,
+            fill_color=corr_color(val, vmin=vmin, vmax=vmax),
+            fill_opacity=1, stroke_width=0
+        )
+        rect.move_to(np.array([-width / 2 + (i + 0.5) * width / steps, 0, 0]))
+        bar.add(rect)
+
+    frame = SurroundingRectangle(bar, color=GRID_COLOR, buff=0.0, stroke_width=0.8)
+    lmin = Text(f"{vmin:.2f}", font_size=10, color=SOFT_WHITE).next_to(bar, LEFT, buff=0.08)
+    lzero = Text("0", font_size=10, color=SOFT_WHITE).next_to(bar, DOWN, buff=0.06)
+    lmax = Text(f"{vmax:.2f}", font_size=10, color=SOFT_WHITE).next_to(bar, RIGHT, buff=0.08)
+    ttl = Text(title, font_size=12, color=SOFT_WHITE).next_to(bar, UP, buff=0.05)
+    return VGroup(bar, frame, lmin, lzero, lmax, ttl)
+
+
 def koch_curve(start, end, depth):
     if depth == 0:
         return [start, end]
@@ -106,21 +159,21 @@ def sierpinski_triangles(v1, v2, v3, depth):
 
 
 def corr_to_heatmap(matrix, width=4, height=4, vmin=-0.3, vmax=0.3,
-                    downsample=None):
+                    downsample=None, robust=False):
     """Convert a real correlation matrix into a heatmap VGroup.
     Downsamples large matrices for rendering performance."""
-    mat = matrix.copy()
-    if downsample and mat.shape[0] > downsample:
-        step = mat.shape[0] // downsample
-        mat = mat[::step, ::step]
+    mat = downsample_square_mean(matrix.copy(), downsample)
+    if robust:
+        q = np.quantile(np.abs(mat), 0.95)
+        span = float(max(q, 1e-3))
+        vmin, vmax = -span, span
+
     n = mat.shape[0]
     cell_w, cell_h = width / n, height / n
     group = VGroup()
     for i in range(n):
         for j in range(n):
-            # Map value to color: negative→steel, zero→bg, positive→gold
-            t = np.clip((mat[i, j] - vmin) / (vmax - vmin), 0, 1)
-            color = interpolate_color(ManimColor(STEEL), ManimColor(GOLD), t)
+            color = corr_color(mat[i, j], vmin=vmin, vmax=vmax)
             rect = Rectangle(width=cell_w, height=cell_h, fill_color=color,
                            fill_opacity=1, stroke_width=0)
             rect.move_to(np.array([
@@ -184,15 +237,25 @@ class TheHook(MovingCameraScene):
         self.wait(1)
 
         # Crossfade to REAL correlation matrix
-        hmap = corr_to_heatmap(corr_trained, width=5.5, height=5.5, downsample=50)
+        hook_ds = downsample_square_mean(corr_trained, 56)
+        hook_span = float(max(np.quantile(np.abs(hook_ds), 0.95), 1e-3))
+        hmap = corr_to_heatmap(
+            corr_trained, width=5.5, height=5.5,
+            vmin=-hook_span, vmax=hook_span, downsample=56
+        )
         hmap.move_to(mandelbrot.get_center())
+        legend = corr_legend(
+            width=2.3, vmin=-hook_span, vmax=hook_span
+        ).next_to(hmap, DOWN, buff=0.28)
 
         self.play(FadeOut(mandelbrot, run_time=1.5), FadeIn(hmap, run_time=1.5))
+        self.play(FadeIn(legend), run_time=0.5)
 
         tag = Text("source: L3 attn.c_attn, step 10000", font_size=8,
-                   color=GRID_COLOR).next_to(hmap, DOWN, buff=0.1)
+                   color=GRID_COLOR).next_to(legend, DOWN, buff=0.08)
         self.play(FadeIn(tag), run_time=0.3)
         self.wait(0.5)
+        self.play(FadeOut(legend), run_time=0.3)
 
         # Zoom into nested blocks
         self.play(
@@ -319,6 +382,7 @@ class WhatIsFractal(MovingCameraScene):
 # ============================================================
 class TheExperiment(Scene):
     def construct(self):
+        spec_data = load_data("spectra.npz")
         heading = heading_text("The Experiment")
         self.play(Write(heading), run_time=0.8)
 
@@ -353,24 +417,35 @@ class TheExperiment(Scene):
                               lag_ratio=0.12), run_time=1.5)
         self.wait(0.8)
 
-        ax = make_axes([0, 10000, 2000], [0, 8, 2], x_length=4.5, y_length=2.5)
+        evo_steps = spec_data["evo_steps"].astype(float)
+        evo_alphas = spec_data["evo_alphas"].astype(float)
+        a_min = float(np.floor((evo_alphas.min() - 0.02) * 10) / 10)
+        a_max = float(np.ceil((evo_alphas.max() + 0.02) * 10) / 10)
+        a_step = 0.1 if (a_max - a_min) >= 0.6 else 0.05
+
+        ax = make_axes([0, int(evo_steps[-1]), 2000], [a_min, a_max, a_step],
+                       x_length=4.5, y_length=2.5)
         ax.shift(RIGHT*2 + DOWN*1.8)
         ax_xl = Text("step", font_size=16, color=SOFT_WHITE).next_to(ax, DOWN, buff=0.15)
-        ax_yl = Text("loss", font_size=16, color=SOFT_WHITE).next_to(ax, LEFT, buff=0.15)
-        def loss_fn(x): return 1.1 + 5.9 * np.exp(-x / 1500)
-        loss_curve = ax.plot(loss_fn, x_range=[0, 10000], color=CORAL, stroke_width=2.5)
-        trace_dot = Dot(color=CORAL, radius=0.05).move_to(ax.c2p(0, loss_fn(0)))
-        ckpt_dots = VGroup(*[
-            Dot(ax.c2p(s, loss_fn(s)), radius=0.04, color=TEAL)
-            for s in range(0, 10500, 500)])
+        ax_yl = MathTex(r"\alpha", font_size=20, color=SOFT_WHITE).next_to(ax, LEFT, buff=0.15)
+
+        alpha_pts = [ax.c2p(float(s), float(a)) for s, a in zip(evo_steps, evo_alphas)]
+        alpha_curve = VMobject(color=CORAL, stroke_width=2.5)
+        alpha_curve.set_points_as_corners(alpha_pts)
+        trace_dot = Dot(color=CORAL, radius=0.05).move_to(alpha_pts[0])
+        ckpt_dots = VGroup(*[Dot(p, radius=0.04, color=TEAL) for p in alpha_pts])
+        alpha_note = Text("Real checkpoint metric: power-law exponent",
+                          font_size=13, color=TEAL).next_to(ax, UP, buff=0.1)
 
         self.play(Create(ax), Write(ax_xl), Write(ax_yl), run_time=0.8)
+        self.play(FadeIn(alpha_note), run_time=0.4)
         self.add(trace_dot)
-        self.play(Create(loss_curve), MoveAlongPath(trace_dot, loss_curve),
-                  run_time=2.5, rate_func=linear)
+        self.play(Create(alpha_curve), MoveAlongPath(trace_dot, alpha_curve),
+                  run_time=2.4, rate_func=linear)
         self.remove(trace_dot)
         self.play(LaggedStart(*[FadeIn(d, scale=3) for d in ckpt_dots],
                               lag_ratio=0.02), run_time=0.8)
+        stag = source_tag("source: spectra evolution, layer blocks.3.mlp.c_fc", self)
 
         question = Text("What geometric structure is hiding\nin these weight matrices?",
                        font_size=24, color=GOLD).to_edge(DOWN, buff=0.4)
@@ -504,14 +579,12 @@ class PowerLawsEmerge(Scene):
             safe = lname.replace(".", "_")
             sv = spec_data[f"sv_final_{safe}"]
             alpha = float(spec_data[f"alpha_{safe}"])
-            r2 = float(spec_data[f"r2_{safe}"])
             lr = np.log(np.arange(1, len(sv)+1))
             log_sv = np.log(sv + 1e-10)
             local_idx = np.linspace(0, len(sv)-1, n_pts).astype(int)
             pts = [ax.c2p(lr[i], np.clip(log_sv[i], y_min, y_max)) for i in local_idx]
             curve = VMobject(color=c, stroke_width=2.5)
             curve.set_points_smoothly(pts)
-            short = lname.split(".")
             label = f"L{li} (α={alpha:.2f})"
             lbl = Text(label, font_size=11, color=c).next_to(curve.get_end(), RIGHT, buff=0.1)
             layer_curves.add(VGroup(curve, lbl))
@@ -537,7 +610,7 @@ class FractalAttention(MovingCameraScene):
         heading = heading_text("Finding #2: Fractal Attention")
         self.play(Write(heading), run_time=1)
 
-        subhead = Text("Correlations between neurons in attention layers",
+        subhead = Text(f"Correlations between neurons across {n_layers} layers",
                        font_size=22, color=SOFT_WHITE).next_to(heading, DOWN, buff=0.3)
         self.play(Write(subhead), run_time=0.8)
 
@@ -548,10 +621,23 @@ class FractalAttention(MovingCameraScene):
 
         # Downsample for rendering speed (576x576 → 48x48)
         ds = 48
-        noise_hmap = corr_to_heatmap(corr_init, width=4, height=4, downsample=ds)
+        init_ds = downsample_square_mean(corr_init, ds)
+        final_ds = downsample_square_mean(corr_final, ds)
+        span = float(
+            max(
+                np.quantile(np.abs(np.concatenate([init_ds.ravel(), final_ds.ravel()])), 0.95),
+                1e-3,
+            )
+        )
+        noise_hmap = corr_to_heatmap(
+            corr_init, width=4, height=4, vmin=-span, vmax=span, downsample=ds
+        )
         noise_hmap.shift(LEFT*3.2 + DOWN*0.3)
-        trained_hmap = corr_to_heatmap(corr_final, width=4, height=4, downsample=ds)
+        trained_hmap = corr_to_heatmap(
+            corr_final, width=4, height=4, vmin=-span, vmax=span, downsample=ds
+        )
         trained_hmap.shift(RIGHT*3.2 + DOWN*0.3)
+        legend = corr_legend(width=2.6, vmin=-span, vmax=span).to_edge(DOWN, buff=0.18)
 
         init_label = Text("Step 0 (init)", font_size=22, color=STEEL).next_to(
             noise_hmap, UP, buff=0.2)
@@ -561,6 +647,7 @@ class FractalAttention(MovingCameraScene):
         self.play(Write(init_label), FadeIn(noise_hmap), run_time=1.2)
         self.wait(0.5)
         self.play(Write(trained_label), FadeIn(trained_hmap, shift=UP*0.2), run_time=1.5)
+        self.play(FadeIn(legend), run_time=0.4)
 
         stag = source_tag(f"source: L{demo_layer} attn.c_attn, step 0 vs 10000", self)
         self.wait(1)
@@ -571,7 +658,7 @@ class FractalAttention(MovingCameraScene):
             self.camera.frame.animate.scale(0.5).move_to(
                 trained_hmap.get_center() + LEFT*0.3 + UP*0.3),
             FadeOut(noise_hmap), FadeOut(init_label),
-            FadeOut(trained_label), FadeOut(subhead), FadeOut(stag),
+            FadeOut(trained_label), FadeOut(subhead), FadeOut(stag), FadeOut(legend),
             run_time=2.5, rate_func=smooth)
 
         z1 = Text("Large blocks emerge...", font_size=10,
@@ -603,7 +690,9 @@ class FractalAttention(MovingCameraScene):
         # Sierpinski comparison
         self.play(FadeOut(trained_hmap), FadeOut(fractal_text))
 
-        small_hmap = corr_to_heatmap(corr_final, width=4, height=4, downsample=ds)
+        small_hmap = corr_to_heatmap(
+            corr_final, width=4, height=4, vmin=-span, vmax=span, downsample=ds
+        )
         small_hmap.shift(LEFT*3.5 + DOWN*0.3)
         hmap_label = Text("Real Attention Correlations", font_size=16,
                          color=GOLD).next_to(small_hmap, DOWN, buff=0.15)
@@ -710,7 +799,7 @@ class ScaledCopies(Scene):
             local_idx = np.linspace(0, len(sv)-1, n_pts).astype(int)
             pts = [ax.c2p(log_rank[k], np.clip(log_sv[k], y_min, y_max)) for k in local_idx]
             curve = VMobject(color=c, stroke_width=2.5)
-            curve.set_points_smoothly(pts)
+            curve.set_points_as_corners(pts)
             lbl = Text(f"L{i}", font_size=16, color=c).next_to(curve.get_start(), UL, buff=0.1)
             curves.append(curve)
             labels.append(lbl)
@@ -728,23 +817,39 @@ class ScaledCopies(Scene):
         # We need a new axis range for normalized values
         norm_log_svs = [np.log(sv_norm + 1e-10) for sv_norm in sv_norms]
         ny_min = float(np.floor(min(ls.min() for ls in norm_log_svs)))
-        ny_max = 0.1  # log(1) = 0
-
-        # Transform curves to overlap
-        mid_sv = sv_raws[len(sv_raws)//2]
-        mid_log = np.log(mid_sv + 1e-10)
-        local_idx = np.linspace(0, len(mid_sv)-1, n_pts).astype(int)
-        target_pts = [ax.c2p(log_rank[k], np.clip(mid_log[k], y_min, y_max)) for k in local_idx]
+        ny_max = 0.15  # log(1) = 0
+        ax_norm = make_axes([0, x_max, 1], [ny_min, ny_max, 1], x_length=8, y_length=4)
+        ax_norm.shift(DOWN * 0.5)
+        x_lb_norm = MathTex(r"\log(\text{rank})", font_size=22,
+                            color=SOFT_WHITE).next_to(ax_norm.x_axis, DOWN, buff=0.2)
+        y_lb_norm = MathTex(r"\log(\sigma/\sigma_1)", font_size=22,
+                            color=SOFT_WHITE).next_to(ax_norm.y_axis, LEFT, buff=0.2)
+        self.play(
+            ReplacementTransform(ax, ax_norm),
+            ReplacementTransform(x_lb, x_lb_norm),
+            ReplacementTransform(y_lb, y_lb_norm),
+            run_time=1.0
+        )
 
         collapse_anims = []
-        for i, curve in enumerate(curves):
-            target = VMobject(color=layer_colors[i], stroke_width=2.5)
-            target.set_points_smoothly(target_pts)
-            collapse_anims.append(Transform(curve, target))
+        for i, (sv_norm, curve, lbl) in enumerate(zip(sv_norms, curves, labels)):
+            log_norm = np.log(sv_norm + 1e-10)
+            local_idx = np.linspace(0, len(sv_norm)-1, n_pts).astype(int)
+            target_pts = [
+                ax_norm.c2p(log_rank[k], np.clip(log_norm[k], ny_min, ny_max))
+                for k in local_idx
+            ]
+            target_curve = VMobject(color=layer_colors[i], stroke_width=2.5)
+            target_curve.set_points_as_corners(target_pts)
+            target_lbl = Text(f"L{i}", font_size=16, color=layer_colors[i]).next_to(
+                target_curve.get_start(), UL, buff=0.08
+            )
+            collapse_anims.append(Transform(curve, target_curve))
+            collapse_anims.append(Transform(lbl, target_lbl))
 
         self.play(*collapse_anims, run_time=2.5, rate_func=smooth)
 
-        same = Text("Same slope. Same shape. Scaled copies.",
+        same = Text("After normalization, the curves nearly overlap.",
                    font_size=26, color=GOLD).to_edge(DOWN, buff=0.4)
         self.play(ReplacementTransform(collapse_text, same), run_time=0.8)
 
