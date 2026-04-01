@@ -47,6 +47,96 @@ def get_weight_matrices(model):
     return matrices
 
 
+# --- Shared helpers ---
+
+def compute_loss_batched(model, n_batches=5):
+    """Evaluate cross-entropy loss averaged over n_batches of fixed data."""
+    data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                     dtype=np.uint16, mode="r")
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for b in range(n_batches):
+            offset = b * BLOCK_SIZE * 4
+            ix = [offset + i * BLOCK_SIZE for i in range(4)
+                  if offset + (i + 1) * BLOCK_SIZE + 1 < len(data)]
+            if not ix:
+                break
+            x = torch.stack([torch.from_numpy(data[i:i+BLOCK_SIZE].astype(np.int64)) for i in ix])
+            y = torch.stack([torch.from_numpy(data[i+1:i+1+BLOCK_SIZE].astype(np.int64)) for i in ix])
+            _, loss = model(x, y)
+            losses.append(loss.item())
+    return np.mean(losses)
+
+
+def set_model_params(model, flat_params):
+    """Set model parameters from a flat tensor."""
+    offset = 0
+    for p in model.parameters():
+        numel = p.numel()
+        p.data.copy_(flat_params[offset:offset + numel].view(p.shape))
+        offset += numel
+
+
+def get_flat_params(model):
+    """Return all model parameters as a single flat tensor."""
+    return torch.cat([p.detach().clone().flatten() for p in model.parameters()])
+
+
+def get_attention_maps(model, x=None):
+    """
+    Extract attention weight matrices for all layers/heads.
+
+    Args:
+        model: GPT model (eval mode)
+        x: input tensor [1, T]. If None, loads first BLOCK_SIZE tokens from train data.
+
+    Returns:
+        dict mapping "layer_{i}" -> np.array of shape [n_head, T, T]
+    """
+    if x is None:
+        data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                         dtype=np.uint16, mode="r")
+        x = torch.from_numpy(data[:BLOCK_SIZE].astype(np.int64)).unsqueeze(0)
+
+    model.eval()
+    attention_maps = {}
+    with torch.no_grad():
+        B, T = x.size()
+        pos = torch.arange(0, T, dtype=torch.long)
+        hidden = model.drop(model.wte(x) + model.wpe(pos))
+
+        for i, block in enumerate(model.blocks):
+            normed = block.ln_1(hidden)
+            qkv = block.attn.c_attn(normed)
+            n_embd = block.attn.n_embd
+            n_head = block.attn.n_head
+            q, k, v = qkv.split(n_embd, dim=2)
+            head_dim = n_embd // n_head
+            q = q.view(B, T, n_head, head_dim).transpose(1, 2)
+            k = k.view(B, T, n_head, head_dim).transpose(1, 2)
+
+            att = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
+            mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+            att = att.masked_fill(mask, float('-inf'))
+            att = torch.softmax(att, dim=-1)
+            attention_maps[f"layer_{i}"] = att[0].numpy()  # [n_head, T, T]
+
+            hidden = hidden + block.attn(block.ln_1(hidden))
+            hidden = hidden + block.mlp(block.ln_2(hidden))
+
+    return attention_maps
+
+
+def load_checkpoint_scaled(path, n_layer, n_embd, n_head):
+    """Load a checkpoint into a parameterized GPT model."""
+    from train_scale import GPT as ScaledGPT
+    model = ScaledGPT(n_layer, n_embd, n_head)
+    model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
 # --- Experiment 1: Eigenvalue spectra (heavy tails) ---
 
 def exp_eigenvalue_spectra():
@@ -2041,6 +2131,1548 @@ def exp_scale_comparison():
         print()
 
 
+# --- Experiment 19: RMT-Denoised Spectral Metrics ---
+
+def exp_rmt_denoised():
+    """
+    Random Matrix Theory denoising of weight spectra.
+
+    Methodology (ArXiv-grade):
+    ──────────────────────────
+    For a weight matrix W ∈ ℝ^{m×n} (m ≥ n), compute the singular values σ₁ ≥ σ₂ ≥ … ≥ σₙ
+    and eigenvalues λᵢ = σᵢ². Under the null hypothesis that W is iid Gaussian with variance
+    σ², the eigenvalue distribution converges to the Marchenko-Pastur (MP) law:
+
+        ρ_MP(λ) = (1/(2πσ²γλ)) √((λ₊ - λ)(λ - λ₋))
+
+    where γ = m/n (aspect ratio), λ₊ = σ²(1 + √γ)², λ₋ = σ²(1 - √γ)².
+
+    Denoising: eigenvalues above λ₊ are "signal" (informative); below are "bulk" (noise).
+    We estimate σ² via the median eigenvalue (robust to heavy tails), then apply the
+    Gavish-Donoho optimal hard threshold for singular values.
+
+    Tail fitting: on signal eigenvalues, we fit:
+      1. Power law via MLE: α̂ = 1 + n/Σ ln(xᵢ/x_min)  (Clauset et al. 2009)
+      2. Log-normal via scipy MLE
+      3. Exponential via scipy MLE
+    Model comparison via Kolmogorov-Smirnov test and log-likelihood ratios.
+
+    Controls:
+      - Pure random matrix (same shape, σ=0.02): should show NO signal above MP edge
+      - Planted heavy-tail (random + rank-5 power-law component): should recover planted tail
+
+    Outputs:
+      - plots/rmt_denoised_spectra.png (eigenvalue histograms with MP edge)
+      - plots/rmt_tail_fits.png (CCDF with competing fits)
+      - plots/rmt_evolution.png (α_MLE and KS across checkpoints)
+      - plots/rmt_controls.png (synthetic controls)
+      - plots/rmt_data.npz (all numerical results for paper tables)
+    """
+    from scipy.stats import kstest, lognorm, expon
+
+    checkpoints = get_checkpoints()
+    print(f"RMT denoising across {len(checkpoints)} checkpoints...")
+
+    # --- helper functions ---
+
+    def mp_upper_edge(m, n, sigma_sq):
+        """Marchenko-Pastur upper edge: λ₊ = σ²(1 + √(m/n))²"""
+        gamma = m / n
+        return sigma_sq * (1 + np.sqrt(gamma)) ** 2
+
+    def estimate_noise_variance(eigenvalues, gamma):
+        """
+        Estimate σ² from bulk eigenvalues using the median.
+        For MP distribution, median ≈ σ² × m_γ where m_γ is the MP median.
+        We use a simpler robust estimator: σ² = median(λ) / (1 + √γ)²
+        which is conservative (underestimates noise → keeps more signal).
+        """
+        med = np.median(eigenvalues)
+        # Approximate: median of MP is close to the center of the bulk
+        mp_center = (1 + gamma) / 2  # rough center for σ²=1
+        if mp_center > 0:
+            return med / mp_center
+        return med
+
+    def fit_power_law_mle(data):
+        """
+        MLE power-law exponent (Clauset et al. 2009).
+        α̂ = 1 + n / Σ ln(xᵢ / x_min)
+        Returns: alpha, x_min
+        """
+        x_min = np.min(data)
+        if x_min <= 0:
+            return np.nan, np.nan
+        n = len(data)
+        alpha = 1 + n / np.sum(np.log(data / x_min))
+        return alpha, x_min
+
+    def power_law_ccdf(x, alpha, x_min):
+        """Complementary CDF: P(X > x) = (x/x_min)^{-(α-1)}"""
+        return (x / x_min) ** (-(alpha - 1))
+
+    def log_likelihood_power_law(data, alpha, x_min):
+        """Log-likelihood of power-law fit."""
+        n = len(data)
+        if alpha <= 1 or x_min <= 0:
+            return -np.inf
+        return n * np.log(alpha - 1) - n * np.log(x_min) - alpha * np.sum(np.log(data / x_min))
+
+    def mp_density(lam, sigma_sq, gamma):
+        """Marchenko-Pastur density for plotting."""
+        lam_plus = sigma_sq * (1 + np.sqrt(gamma)) ** 2
+        lam_minus = sigma_sq * (1 - np.sqrt(gamma)) ** 2
+        density = np.zeros_like(lam)
+        mask = (lam >= lam_minus) & (lam <= lam_plus)
+        if np.any(mask):
+            density[mask] = np.sqrt((lam_plus - lam[mask]) * (lam[mask] - lam_minus)) / (
+                2 * np.pi * sigma_sq * gamma * lam[mask])
+        return density
+
+    # --- main analysis ---
+
+    # Pick 4 representative layers for detailed plots
+    init_model = load_checkpoint(checkpoints[0])
+    final_model = load_checkpoint(checkpoints[-1])
+    weight_names = [n for n in get_weight_matrices(init_model).keys()]
+    # Pick diverse layers: early attn, early MLP, late attn, late MLP
+    repr_layers = []
+    for keyword in ["blocks.0.attn.c_attn", "blocks.0.mlp.c_fc",
+                     "blocks.4.attn.c_attn", "blocks.4.mlp.c_fc"]:
+        matches = [n for n in weight_names if keyword in n]
+        if matches:
+            repr_layers.append(matches[0])
+    if len(repr_layers) < 4:
+        repr_layers = weight_names[:4]
+
+    print(f"Representative layers: {repr_layers}")
+
+    # ========================================
+    # Plot 1: Eigenvalue histograms with MP edge
+    # ========================================
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle("RMT Denoising: Eigenvalue Spectra vs Marchenko-Pastur Boundary",
+                 fontsize=14, fontweight='bold')
+
+    all_results = {}
+
+    for col, layer_name in enumerate(repr_layers):
+        for row, (model, label, ckpt_label) in enumerate([
+            (init_model, "Init (step 0)", "init"),
+            (final_model, f"Trained (step {len(checkpoints)*500-500})", "final"),
+        ]):
+            ax = axes[row, col]
+            W = dict(model.named_parameters())[layer_name].detach().numpy()
+            m, n = W.shape
+            if m < n:
+                W = W.T
+                m, n = W.shape
+            gamma = m / n
+
+            S = np.linalg.svd(W, compute_uv=False)
+            eigenvalues = S ** 2
+
+            # estimate noise and MP edge
+            sigma_sq = estimate_noise_variance(eigenvalues, gamma)
+            lam_plus = mp_upper_edge(m, n, sigma_sq)
+
+            # signal vs bulk split
+            signal_mask = eigenvalues > lam_plus
+            n_signal = np.sum(signal_mask)
+            signal_eigs = eigenvalues[signal_mask]
+            bulk_eigs = eigenvalues[~signal_mask]
+
+            # plot histogram
+            bins = np.linspace(0, np.max(eigenvalues) * 1.1, 80)
+            ax.hist(bulk_eigs, bins=bins, alpha=0.6, color='steelblue',
+                    density=True, label=f'Bulk ({len(bulk_eigs)})')
+            if len(signal_eigs) > 0:
+                ax.hist(signal_eigs, bins=bins, alpha=0.6, color='coral',
+                        density=True, label=f'Signal ({len(signal_eigs)})')
+
+            # overlay MP density
+            lam_range = np.linspace(max(bins[0], 1e-6), bins[-1], 500)
+            mp_curve = mp_density(lam_range, sigma_sq, gamma)
+            ax.plot(lam_range, mp_curve, 'k--', linewidth=1.5, label='MP density')
+
+            # MP edge line
+            ax.axvline(lam_plus, color='red', linestyle=':', linewidth=2,
+                       label=f'$\\lambda_+={lam_plus:.4f}$')
+
+            ax.set_xlabel('$\\lambda$ (eigenvalue)')
+            if col == 0:
+                ax.set_ylabel('Density')
+            short_name = layer_name.split(".")[-1]
+            layer_idx = layer_name.split(".")[1] if "blocks" in layer_name else "?"
+            ax.set_title(f'L{layer_idx} {short_name}\n{label}', fontsize=10)
+            ax.legend(fontsize=7)
+
+            key = f"{ckpt_label}_{layer_name}"
+            all_results[key] = {
+                "sigma_sq": sigma_sq, "lam_plus": lam_plus,
+                "n_signal": n_signal, "n_total": len(eigenvalues),
+                "signal_frac": n_signal / len(eigenvalues),
+            }
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "rmt_denoised_spectra.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Plot 2: CCDF with competing tail fits
+    # ========================================
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle("Signal Tail Fits: Power Law vs Log-Normal vs Exponential (Trained Weights)",
+                 fontsize=14, fontweight='bold')
+
+    fit_results = {}
+
+    for col, layer_name in enumerate(repr_layers):
+        ax = axes[col]
+        W = dict(final_model.named_parameters())[layer_name].detach().numpy()
+        m, n = W.shape
+        if m < n:
+            W = W.T
+            m, n = W.shape
+        gamma = m / n
+
+        S = np.linalg.svd(W, compute_uv=False)
+        eigenvalues = S ** 2
+        sigma_sq = estimate_noise_variance(eigenvalues, gamma)
+        lam_plus = mp_upper_edge(m, n, sigma_sq)
+        signal_eigs = np.sort(eigenvalues[eigenvalues > lam_plus])[::-1]
+
+        if len(signal_eigs) < 5:
+            ax.text(0.5, 0.5, f'Only {len(signal_eigs)} signal eigs\n(too few to fit)',
+                    transform=ax.transAxes, ha='center', va='center')
+            continue
+
+        # Empirical CCDF
+        n_sig = len(signal_eigs)
+        sorted_sig = np.sort(signal_eigs)
+        ccdf_empirical = np.arange(n_sig, 0, -1) / n_sig
+        ax.plot(sorted_sig, ccdf_empirical, 'ko', markersize=3, label='Empirical CCDF')
+
+        # Fit 1: Power law (MLE)
+        alpha_pl, x_min_pl = fit_power_law_mle(signal_eigs)
+        if not np.isnan(alpha_pl):
+            x_fit = np.linspace(sorted_sig[0], sorted_sig[-1], 200)
+            ccdf_pl = power_law_ccdf(x_fit, alpha_pl, x_min_pl)
+            ax.plot(x_fit, ccdf_pl, 'r-', linewidth=2,
+                    label=f'Power law ($\\alpha$={alpha_pl:.2f})')
+            # KS test
+            ks_pl, p_pl = kstest(signal_eigs / x_min_pl,
+                                 lambda x: 1 - x ** (-(alpha_pl - 1)))
+            ll_pl = log_likelihood_power_law(signal_eigs, alpha_pl, x_min_pl)
+
+        # Fit 2: Log-normal
+        try:
+            shape_ln, loc_ln, scale_ln = lognorm.fit(signal_eigs, floc=0)
+            ccdf_ln = 1 - lognorm.cdf(sorted_sig, shape_ln, loc=loc_ln, scale=scale_ln)
+            ax.plot(sorted_sig, ccdf_ln, 'b--', linewidth=2,
+                    label=f'Log-normal ($\\sigma$={shape_ln:.2f})')
+            ks_ln, p_ln = kstest(signal_eigs, 'lognorm', args=(shape_ln, loc_ln, scale_ln))
+            ll_ln = np.sum(lognorm.logpdf(signal_eigs, shape_ln, loc=loc_ln, scale=scale_ln))
+        except Exception:
+            ks_ln, p_ln, ll_ln = np.nan, np.nan, -np.inf
+
+        # Fit 3: Exponential
+        try:
+            loc_ex, scale_ex = expon.fit(signal_eigs, floc=np.min(signal_eigs))
+            ccdf_ex = 1 - expon.cdf(sorted_sig, loc=loc_ex, scale=scale_ex)
+            ax.plot(sorted_sig, ccdf_ex, 'g:', linewidth=2,
+                    label=f'Exponential ($\\lambda$={1/scale_ex:.2f})')
+            ks_ex, p_ex = kstest(signal_eigs, 'expon', args=(loc_ex, scale_ex))
+            ll_ex = np.sum(expon.logpdf(signal_eigs, loc=loc_ex, scale=scale_ex))
+        except Exception:
+            ks_ex, p_ex, ll_ex = np.nan, np.nan, -np.inf
+
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.set_xlabel('$\\lambda$ (eigenvalue)')
+        ax.set_ylabel('$P(X > \\lambda)$')
+        short_name = layer_name.split(".")[-1]
+        layer_idx = layer_name.split(".")[1] if "blocks" in layer_name else "?"
+        ax.set_title(f'L{layer_idx} {short_name} ({n_sig} signal eigs)', fontsize=10)
+        ax.legend(fontsize=7)
+
+        fit_results[layer_name] = {
+            "alpha_pl": alpha_pl, "ks_pl": ks_pl, "p_pl": p_pl, "ll_pl": ll_pl,
+            "ks_ln": ks_ln, "p_ln": p_ln, "ll_ln": ll_ln,
+            "ks_ex": ks_ex, "p_ex": p_ex, "ll_ex": ll_ex,
+            "n_signal": n_sig,
+            "lr_pl_vs_ln": ll_pl - ll_ln if not np.isnan(ll_ln) else np.nan,
+            "lr_pl_vs_ex": ll_pl - ll_ex if not np.isnan(ll_ex) else np.nan,
+        }
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "rmt_tail_fits.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # Print fit comparison table
+    print("\n=== Tail Fit Comparison (trained weights) ===")
+    print(f"{'Layer':<35} {'n_sig':>5} {'α_PL':>6} {'KS_PL':>7} {'KS_LN':>7} {'KS_EX':>7} {'LR(PL/LN)':>10} {'LR(PL/EX)':>10}")
+    for layer_name, fr in fit_results.items():
+        short = layer_name.replace("blocks.", "L").replace(".weight", "")
+        print(f"{short:<35} {fr['n_signal']:>5d} {fr['alpha_pl']:>6.2f} "
+              f"{fr['ks_pl']:>7.3f} {fr['ks_ln']:>7.3f} {fr['ks_ex']:>7.3f} "
+              f"{fr.get('lr_pl_vs_ln', np.nan):>10.1f} {fr.get('lr_pl_vs_ex', np.nan):>10.1f}")
+
+    # ========================================
+    # Plot 3: Evolution across checkpoints
+    # ========================================
+    # Track α_MLE and signal fraction for 2 representative layers across all checkpoints
+    evo_layers = repr_layers[:2]
+    evo_data = {ln: {"steps": [], "alpha": [], "n_signal": [], "signal_frac": []} for ln in evo_layers}
+
+    for ci, ckpt_path in enumerate(checkpoints):
+        step = ci * 500
+        model = load_checkpoint(ckpt_path)
+        for layer_name in evo_layers:
+            W = dict(model.named_parameters())[layer_name].detach().numpy()
+            m, n = W.shape
+            if m < n:
+                W = W.T
+                m, n = W.shape
+            gamma = m / n
+            S = np.linalg.svd(W, compute_uv=False)
+            eigenvalues = S ** 2
+            sigma_sq = estimate_noise_variance(eigenvalues, gamma)
+            lam_plus = mp_upper_edge(m, n, sigma_sq)
+            signal_eigs = eigenvalues[eigenvalues > lam_plus]
+
+            if len(signal_eigs) >= 3:
+                alpha, _ = fit_power_law_mle(signal_eigs)
+            else:
+                alpha = np.nan
+
+            evo_data[layer_name]["steps"].append(step)
+            evo_data[layer_name]["alpha"].append(alpha)
+            evo_data[layer_name]["n_signal"].append(len(signal_eigs))
+            evo_data[layer_name]["signal_frac"].append(len(signal_eigs) / len(eigenvalues))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("RMT Denoised Metrics Over Training", fontsize=14, fontweight='bold')
+
+    colors = ['coral', 'steelblue']
+    for i, layer_name in enumerate(evo_layers):
+        d = evo_data[layer_name]
+        short = layer_name.replace("blocks.", "L").replace(".weight", "")
+
+        axes[0].plot(d["steps"], d["alpha"], 'o-', color=colors[i], label=short, markersize=4)
+        axes[1].plot(d["steps"], d["n_signal"], 'o-', color=colors[i], label=short, markersize=4)
+        axes[2].plot(d["steps"], d["signal_frac"], 'o-', color=colors[i], label=short, markersize=4)
+
+    axes[0].set_ylabel('$\\hat{\\alpha}_{MLE}$ (power-law exponent)')
+    axes[0].set_xlabel('Training step')
+    axes[0].set_title('Power-Law Exponent Evolution')
+    axes[0].legend()
+    axes[0].axhline(y=2.0, color='gray', linestyle='--', alpha=0.5, label='α=2 (Zipf)')
+
+    axes[1].set_ylabel('Number of signal eigenvalues')
+    axes[1].set_xlabel('Training step')
+    axes[1].set_title('Signal Eigenvalues Above MP Edge')
+    axes[1].legend()
+
+    axes[2].set_ylabel('Signal fraction')
+    axes[2].set_xlabel('Training step')
+    axes[2].set_title('Fraction of Spectrum Above MP Edge')
+    axes[2].legend()
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "rmt_evolution.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Plot 4: Synthetic controls
+    # ========================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("RMT Controls: Random vs Planted Heavy-Tail Matrix",
+                 fontsize=14, fontweight='bold')
+
+    # Control 1: Pure random matrix (same shape as first repr layer)
+    W_ref = dict(final_model.named_parameters())[repr_layers[0]].detach().numpy()
+    m, n = W_ref.shape
+    if m < n:
+        m, n = n, m
+
+    np.random.seed(42)
+    W_rand = np.random.randn(m, n) * 0.02
+    S_rand = np.linalg.svd(W_rand, compute_uv=False)
+    eig_rand = S_rand ** 2
+    gamma = m / n
+    sigma_sq_rand = estimate_noise_variance(eig_rand, gamma)
+    lam_plus_rand = mp_upper_edge(m, n, sigma_sq_rand)
+    n_signal_rand = np.sum(eig_rand > lam_plus_rand)
+
+    bins = np.linspace(0, np.max(eig_rand) * 1.1, 60)
+    axes[0].hist(eig_rand, bins=bins, alpha=0.7, color='steelblue', density=True, label='Eigenvalues')
+    lam_range = np.linspace(max(bins[0], 1e-8), bins[-1], 500)
+    mp_curve = mp_density(lam_range, sigma_sq_rand, gamma)
+    axes[0].plot(lam_range, mp_curve, 'k--', linewidth=2, label='MP density')
+    axes[0].axvline(lam_plus_rand, color='red', linestyle=':', linewidth=2,
+                     label=f'$\\lambda_+={lam_plus_rand:.6f}$')
+    axes[0].set_title(f'Random Matrix ({m}×{n}, σ=0.02)\nSignal above MP edge: {n_signal_rand}')
+    axes[0].set_xlabel('$\\lambda$')
+    axes[0].set_ylabel('Density')
+    axes[0].legend(fontsize=8)
+
+    # Control 2: Planted heavy-tail matrix
+    W_planted = np.random.randn(m, n) * 0.02
+    # Add rank-5 component with power-law singular values
+    planted_svs = np.array([1.0, 0.5, 0.25, 0.125, 0.0625])  # power-law decay
+    U_plant = np.linalg.qr(np.random.randn(m, 5))[0]
+    V_plant = np.linalg.qr(np.random.randn(n, 5))[0]
+    W_planted += U_plant @ np.diag(planted_svs) @ V_plant.T
+
+    S_planted = np.linalg.svd(W_planted, compute_uv=False)
+    eig_planted = S_planted ** 2
+    sigma_sq_pl = estimate_noise_variance(eig_planted, gamma)
+    lam_plus_pl = mp_upper_edge(m, n, sigma_sq_pl)
+    signal_planted = eig_planted[eig_planted > lam_plus_pl]
+    n_signal_planted = len(signal_planted)
+
+    bins2 = np.linspace(0, np.max(eig_planted) * 1.1, 80)
+    bulk_pl = eig_planted[eig_planted <= lam_plus_pl]
+    axes[1].hist(bulk_pl, bins=bins2, alpha=0.6, color='steelblue', density=True, label='Bulk')
+    axes[1].hist(signal_planted, bins=bins2, alpha=0.6, color='coral', density=True, label='Signal')
+    lam_range2 = np.linspace(max(bins2[0], 1e-8), bins2[-1], 500)
+    mp_curve2 = mp_density(lam_range2, sigma_sq_pl, gamma)
+    axes[1].plot(lam_range2, mp_curve2, 'k--', linewidth=2, label='MP density')
+    axes[1].axvline(lam_plus_pl, color='red', linestyle=':', linewidth=2,
+                     label=f'$\\lambda_+={lam_plus_pl:.4f}$')
+    axes[1].set_title(f'Planted Matrix (rank-5 signal)\nRecovered {n_signal_planted} signal eigs (planted 5)')
+    axes[1].set_xlabel('$\\lambda$')
+    axes[1].set_ylabel('Density')
+    axes[1].legend(fontsize=8)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "rmt_controls.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Save structured data for paper
+    # ========================================
+    save_data = {
+        "repr_layers": np.array(repr_layers, dtype=object),
+    }
+    for layer_name in evo_layers:
+        d = evo_data[layer_name]
+        key = layer_name.replace(".", "_")
+        save_data[f"{key}_steps"] = np.array(d["steps"])
+        save_data[f"{key}_alpha"] = np.array(d["alpha"])
+        save_data[f"{key}_n_signal"] = np.array(d["n_signal"])
+        save_data[f"{key}_signal_frac"] = np.array(d["signal_frac"])
+    for layer_name, fr in fit_results.items():
+        key = layer_name.replace(".", "_")
+        for k, v in fr.items():
+            save_data[f"fit_{key}_{k}"] = np.array(v)
+    save_data["control_random_n_signal"] = np.array(n_signal_rand)
+    save_data["control_planted_n_signal"] = np.array(n_signal_planted)
+
+    npz_path = os.path.join(PLOTS_DIR, "rmt_data.npz")
+    np.savez_compressed(npz_path, **save_data)
+    print(f"Saved: {npz_path}")
+
+    print("\n=== RMT Denoised Spectral Analysis Complete ===")
+    print(f"Key finding: trained weights have {all_results.get(f'final_{repr_layers[0]}', {}).get('signal_frac', 0):.1%} "
+          f"of spectrum above MP edge vs init")
+
+
+# --- Experiment 20: Attention Graph Spectral Diagnostics ---
+
+def exp_attn_graph_spectral():
+    """
+    Graph-theoretic analysis of attention maps via Laplacian spectral decomposition.
+
+    Methodology (ArXiv-grade):
+    ──────────────────────────
+    Each attention map A ∈ ℝ^{T×T} (T = sequence length) is treated as the weighted
+    adjacency matrix of a directed graph. We symmetrize: Ã = (A + Aᵀ)/2, then compute
+    the normalized graph Laplacian:
+
+        L_norm = I - D^{-1/2} Ã D^{-1/2}
+
+    where D = diag(Ã·1) is the degree matrix. The eigenvalues 0 = λ₀ ≤ λ₁ ≤ … ≤ λ_{T-1}
+    encode graph structure:
+
+    Metrics:
+      1. Fiedler value (λ₁): algebraic connectivity — measures how well-connected the graph
+         is. Higher λ₁ → harder to bipartition → more globally integrated attention.
+
+      2. Spectral entropy: H = -Σᵢ pᵢ ln(pᵢ) where pᵢ = λᵢ/Σλ (for λᵢ > 0).
+         Measures spread of Laplacian spectrum. Uniform → high entropy → evenly distributed
+         structure across scales.
+
+      3. High-frequency energy ratio: E_HF = Σᵢ₌ₜ/₂^{T-1} λᵢ / Σλ.
+         High → lots of local/fine-grained structure (tokens attend to nearby tokens).
+         Low → attention is smooth/global.
+
+      4. Modularity (Newman 2006): Q = (1/2m) Σᵢⱼ (Ãᵢⱼ - dᵢdⱼ/2m) δ(cᵢ,cⱼ)
+         using spectral bipartition from the Fiedler vector. Measures how strongly
+         the graph decomposes into communities.
+
+    Controls:
+      - Degree-preserving randomization: permute entries within each row
+      - Token-order shuffle: randomly permute token positions before computing attention
+
+    Outputs:
+      - plots/attn_graph_fiedler.png
+      - plots/attn_graph_spectral_entropy.png
+      - plots/attn_graph_hf_energy.png
+      - plots/attn_graph_summary.png
+      - plots/attn_graph_data.npz
+    """
+    checkpoints = get_checkpoints()
+    # Use 5 evenly-spaced checkpoints for efficiency
+    ckpt_indices = np.linspace(0, len(checkpoints) - 1, 5, dtype=int)
+    ckpt_paths = [checkpoints[i] for i in ckpt_indices]
+    steps = [i * 500 for i in ckpt_indices]
+    print(f"Attention graph analysis at steps: {steps}")
+
+    # --- graph metric functions ---
+
+    def compute_graph_metrics(A):
+        """
+        Compute Laplacian spectral metrics for a single attention map.
+
+        Args:
+            A: np.array of shape [T, T], attention weights (row-stochastic after softmax)
+
+        Returns:
+            dict with fiedler, spectral_entropy, hf_energy, modularity
+        """
+        T = A.shape[0]
+
+        # Symmetrize
+        A_sym = (A + A.T) / 2
+
+        # Degree matrix
+        d = A_sym.sum(axis=1)
+        d_safe = np.maximum(d, 1e-10)  # avoid division by zero
+
+        # Normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(d_safe))
+        L_norm = np.eye(T) - D_inv_sqrt @ A_sym @ D_inv_sqrt
+
+        # Eigenvalues (symmetric → eigvalsh)
+        eigs = np.linalg.eigvalsh(L_norm)
+        eigs = np.sort(np.real(eigs))
+        # Clamp small negatives from numerical error
+        eigs = np.maximum(eigs, 0)
+
+        # Fiedler value (second smallest eigenvalue)
+        fiedler = eigs[1] if len(eigs) > 1 else 0.0
+
+        # Spectral entropy
+        pos_eigs = eigs[eigs > 1e-10]
+        if len(pos_eigs) > 0:
+            p = pos_eigs / pos_eigs.sum()
+            spectral_entropy = -np.sum(p * np.log(p + 1e-15))
+        else:
+            spectral_entropy = 0.0
+
+        # High-frequency energy ratio
+        total_energy = eigs.sum()
+        if total_energy > 0:
+            hf_energy = eigs[T // 2:].sum() / total_energy
+        else:
+            hf_energy = 0.0
+
+        # Modularity via Fiedler vector bipartition
+        eigvals, eigvecs = np.linalg.eigh(L_norm)
+        fiedler_vec = eigvecs[:, 1]  # second eigenvector
+        partition = (fiedler_vec >= 0).astype(int)
+        m = A_sym.sum() / 2
+        if m > 0:
+            modularity = 0.0
+            for i in range(T):
+                for j in range(T):
+                    if partition[i] == partition[j]:
+                        modularity += A_sym[i, j] - d[i] * d[j] / (2 * m)
+            modularity /= (2 * m)
+        else:
+            modularity = 0.0
+
+        return {
+            "fiedler": fiedler,
+            "spectral_entropy": spectral_entropy,
+            "hf_energy": hf_energy,
+            "modularity": modularity,
+        }
+
+    def degree_preserving_randomize(A, rng):
+        """Randomize attention map while preserving row sums (degree)."""
+        A_rand = A.copy()
+        for i in range(A.shape[0]):
+            row = A_rand[i].copy()
+            rng.shuffle(row)
+            A_rand[i] = row
+        return A_rand
+
+    # --- collect metrics ---
+
+    rng = np.random.RandomState(42)
+
+    # Structure: metrics[step][layer][head] = dict of metrics
+    all_metrics = {"trained": {}, "randomized": {}, "shuffled": {}}
+
+    for si, (ckpt_path, step) in enumerate(zip(ckpt_paths, steps)):
+        print(f"  Processing step {step}...")
+        model = load_checkpoint(ckpt_path)
+
+        # Regular attention maps
+        attn_maps = get_attention_maps(model)
+
+        # Shuffled-token attention maps
+        data = np.memmap(os.path.join(os.path.dirname(__file__), "data", "train.bin"),
+                         dtype=np.uint16, mode="r")
+        x_normal = torch.from_numpy(data[:BLOCK_SIZE].astype(np.int64)).unsqueeze(0)
+        perm = rng.permutation(BLOCK_SIZE)
+        x_shuffled = x_normal[:, perm]
+        attn_maps_shuffled = get_attention_maps(model, x_shuffled)
+
+        for layer_key, attn_all_heads in attn_maps.items():
+            n_heads = attn_all_heads.shape[0]
+            for h in range(n_heads):
+                mk = f"{layer_key}_h{h}"
+
+                # Trained
+                m_trained = compute_graph_metrics(attn_all_heads[h])
+                all_metrics["trained"].setdefault(step, {})[mk] = m_trained
+
+                # Degree-preserving randomized
+                A_rand = degree_preserving_randomize(attn_all_heads[h], rng)
+                m_rand = compute_graph_metrics(A_rand)
+                all_metrics["randomized"].setdefault(step, {})[mk] = m_rand
+
+                # Token-shuffled
+                attn_shuf = attn_maps_shuffled[layer_key][h]
+                m_shuf = compute_graph_metrics(attn_shuf)
+                all_metrics["shuffled"].setdefault(step, {})[mk] = m_shuf
+
+    # --- aggregate for plotting ---
+
+    metric_names = ["fiedler", "spectral_entropy", "hf_energy", "modularity"]
+    conditions = ["trained", "randomized", "shuffled"]
+    cond_colors = {"trained": "coral", "randomized": "steelblue", "shuffled": "gray"}
+
+    # Aggregate: mean and std across heads for each step and condition
+    agg = {cond: {mn: {"mean": [], "std": []} for mn in metric_names} for cond in conditions}
+
+    for cond in conditions:
+        for step in steps:
+            step_data = all_metrics[cond].get(step, {})
+            for mn in metric_names:
+                values = [step_data[mk][mn] for mk in step_data]
+                agg[cond][mn]["mean"].append(np.mean(values))
+                agg[cond][mn]["std"].append(np.std(values))
+
+    # ========================================
+    # Plot individual metric evolution
+    # ========================================
+    for mn, ylabel, title in [
+        ("fiedler", "$\\lambda_1$ (Fiedler value)", "Algebraic Connectivity Over Training"),
+        ("spectral_entropy", "$H$ (spectral entropy)", "Spectral Entropy Over Training"),
+        ("hf_energy", "$E_{HF}$ (high-freq ratio)", "High-Frequency Energy Over Training"),
+    ]:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for cond in conditions:
+            means = agg[cond][mn]["mean"]
+            stds = agg[cond][mn]["std"]
+            ax.plot(steps, means, 'o-', color=cond_colors[cond], label=cond, linewidth=2)
+            ax.fill_between(steps,
+                            np.array(means) - np.array(stds),
+                            np.array(means) + np.array(stds),
+                            color=cond_colors[cond], alpha=0.15)
+        ax.set_xlabel("Training Step")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+        fname = f"attn_graph_{mn}.png"
+        path = os.path.join(PLOTS_DIR, fname)
+        plt.savefig(path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {path}")
+
+    # ========================================
+    # Summary plot: all metrics in one figure
+    # ========================================
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Attention Graph Spectral Diagnostics: Trained vs Controls",
+                 fontsize=14, fontweight='bold')
+
+    for ax, (mn, ylabel) in zip(axes.flat, [
+        ("fiedler", "$\\lambda_1$ (Fiedler)"),
+        ("spectral_entropy", "$H$ (spectral entropy)"),
+        ("hf_energy", "$E_{HF}$ (high-freq)"),
+        ("modularity", "$Q$ (modularity)"),
+    ]):
+        for cond in conditions:
+            means = agg[cond][mn]["mean"]
+            stds = agg[cond][mn]["std"]
+            ax.plot(steps, means, 'o-', color=cond_colors[cond], label=cond, linewidth=2)
+            ax.fill_between(steps,
+                            np.array(means) - np.array(stds),
+                            np.array(means) + np.array(stds),
+                            color=cond_colors[cond], alpha=0.15)
+        ax.set_xlabel("Training Step")
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "attn_graph_summary.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Save structured data
+    # ========================================
+    save_data = {"steps": np.array(steps)}
+    for cond in conditions:
+        for mn in metric_names:
+            save_data[f"{cond}_{mn}_mean"] = np.array(agg[cond][mn]["mean"])
+            save_data[f"{cond}_{mn}_std"] = np.array(agg[cond][mn]["std"])
+
+    npz_path = os.path.join(PLOTS_DIR, "attn_graph_data.npz")
+    np.savez_compressed(npz_path, **save_data)
+    print(f"Saved: {npz_path}")
+
+    # Print summary table
+    print("\n=== Attention Graph Metrics (init → final) ===")
+    for mn in metric_names:
+        trained_init = agg["trained"][mn]["mean"][0]
+        trained_final = agg["trained"][mn]["mean"][-1]
+        rand_final = agg["randomized"][mn]["mean"][-1]
+        print(f"  {mn:>20}: {trained_init:.4f} → {trained_final:.4f} "
+              f"(Δ={trained_final-trained_init:+.4f}) | random control: {rand_final:.4f}")
+
+
+# --- Experiment 21: Critical-LR Fractal Basin Maps ---
+
+def exp_critical_lr():
+    """
+    Map the convergence boundary in (learning rate × seed) space near the critical LR.
+
+    Methodology (ArXiv-grade):
+    ──────────────────────────
+    For a model trained with AdamW + cosine schedule, there exists a critical learning
+    rate lr* above which training diverges. Near lr*, the boundary between stable and
+    diverged runs in (LR, seed) space may exhibit fractal structure — analogous to
+    Julia set boundaries in dynamical systems.
+
+    Protocol:
+      1. Coarse search: 10 log-spaced LRs in [1e-4, 1e-1], 3 seeds, 1000 steps
+         → identify lr* (smallest LR where >50% diverge)
+      2. Dense sweep: 20 log-spaced LRs in [0.5·lr*, 2·lr*], 16 seeds, 1000 steps
+      3. Classify each run as stable (final loss < 2.0), slow (≥ 2.0), or diverged (NaN/loss > 100)
+      4. Box-counting dimension of the stable/diverged boundary
+
+    Box-counting dimension:
+      Partition the (LR, seed) grid at resolution ε. Count N(ε) = number of boxes
+      containing BOTH stable and diverged runs. If the boundary is fractal:
+        N(ε) ~ ε^{-D}
+      and D > 1 indicates fractal boundary (smooth boundary → D = 1).
+
+    Bootstrap 95% CI: resample the seed axis 1000 times, recompute D each time.
+
+    Controls:
+      - Convex model (single linear layer): boundary should be smooth (D ≈ 1)
+      - Shuffled labels: different boundary structure
+
+    Outputs:
+      - plots/critical_lr_basin_map.png
+      - plots/critical_lr_boundary_dimension.png
+      - plots/critical_lr_controls.png
+      - plots/critical_lr_data.npz
+
+    Requires: run 'uv run train_sweep.py --critical-lr small' first,
+              or this function runs the sweep inline.
+    """
+    from train_sweep import train_seeded, classify_run, find_critical_lr
+
+    data_path = os.path.join(PLOTS_DIR, "critical_lr_data.npz")
+
+    if os.path.exists(data_path):
+        print("Loading pre-computed sweep data...")
+        cached = np.load(data_path, allow_pickle=True)
+        lr_values = cached["lr_values"]
+        outcome_grid = cached["outcome_grid"]
+        final_loss_grid = cached["final_loss_grid"]
+        lr_critical = float(cached["lr_critical"])
+    else:
+        print("Running LR sweep...")
+
+        # Step 1: Sweep a wide LR range directly (skip coarse search —
+        # the boundary is between "training makes progress" and "diverged").
+        # Use 1000 steps so the model has time to either converge or blow up.
+        n_lrs = 12
+        n_seeds = 10
+        max_steps_sweep = 1000
+
+        # Wide range: 1e-3 to 1.0 — need very high LR to break AdamW + grad clip
+        lr_values = np.logspace(-3, 0, n_lrs)
+        lr_critical = lr_values[n_lrs // 2]  # rough center, refined below
+
+        # outcome_grid[i, j] = 0 (stable), 1 (slow), 2 (diverged)
+        outcome_grid = np.zeros((n_lrs, n_seeds), dtype=int)
+        final_loss_grid = np.zeros((n_lrs, n_seeds))
+
+        for i, lr in enumerate(lr_values):
+            for j in range(n_seeds):
+                print(f"  [{i*n_seeds + j + 1}/{n_lrs*n_seeds}] lr={lr:.2e} seed={j}",
+                      flush=True)
+                r = train_seeded(seed=j, lr=float(lr), max_steps=max_steps_sweep,
+                                 n_layer=3, n_embd=96, n_head=3, quiet=True)
+                final_loss_grid[i, j] = r["final_loss"] if not np.isnan(r["final_loss"]) else 100.0
+
+        # Adaptive classification: use median loss as boundary
+        # Runs with loss < median → "stable", loss > 2×median → "diverged", else "slow"
+        median_loss = np.median(final_loss_grid[np.isfinite(final_loss_grid)])
+        for i in range(n_lrs):
+            for j in range(n_seeds):
+                fl = final_loss_grid[i, j]
+                if np.isnan(fl) or fl > 50:
+                    outcome_grid[i, j] = 2  # diverged
+                elif fl > median_loss * 1.5:
+                    outcome_grid[i, j] = 1  # slow
+                else:
+                    outcome_grid[i, j] = 0  # stable
+        print(f"Median loss: {median_loss:.2f}, threshold: {median_loss*1.5:.2f}", flush=True)
+
+        # Refine lr_critical: first LR where >50% are NOT stable
+        for i, lr in enumerate(lr_values):
+            frac_stable = np.mean(outcome_grid[i] == 0)
+            if frac_stable < 0.5:
+                lr_critical = float(lr)
+                break
+
+        np.savez_compressed(data_path,
+                            lr_values=lr_values, outcome_grid=outcome_grid,
+                            final_loss_grid=final_loss_grid, lr_critical=lr_critical)
+        print(f"Saved sweep data: {data_path}")
+
+    n_lrs, n_seeds = outcome_grid.shape
+    print(f"Grid: {n_lrs} LRs × {n_seeds} seeds, lr* ≈ {lr_critical:.2e}")
+    print(f"Outcomes: stable={np.sum(outcome_grid==0)}, slow={np.sum(outcome_grid==1)}, "
+          f"diverged={np.sum(outcome_grid==2)}")
+
+    # ========================================
+    # Plot 1: Basin map heatmap
+    # ========================================
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Critical-LR Basin Map: Convergence Outcomes in (LR × Seed) Space",
+                 fontsize=14, fontweight='bold')
+
+    # Discrete outcome map
+    cmap_discrete = plt.cm.colors.ListedColormap(['#2ecc71', '#f39c12', '#e74c3c'])
+    im = axes[0].imshow(outcome_grid.T, aspect='auto', origin='lower',
+                         cmap=cmap_discrete, vmin=0, vmax=2)
+    axes[0].set_xlabel('Learning Rate Index')
+    axes[0].set_ylabel('Seed')
+    axes[0].set_title('Outcome (green=stable, yellow=slow, red=diverged)')
+    # Add LR labels
+    tick_idx = np.linspace(0, n_lrs - 1, 5, dtype=int)
+    axes[0].set_xticks(tick_idx)
+    axes[0].set_xticklabels([f'{lr_values[i]:.1e}' for i in tick_idx], rotation=45)
+
+    # Continuous loss map
+    loss_clipped = np.clip(final_loss_grid, 0, 10)
+    im2 = axes[1].imshow(loss_clipped.T, aspect='auto', origin='lower',
+                          cmap='hot_r')
+    axes[1].set_xlabel('Learning Rate Index')
+    axes[1].set_ylabel('Seed')
+    axes[1].set_title('Final Loss (clipped at 10)')
+    axes[1].set_xticks(tick_idx)
+    axes[1].set_xticklabels([f'{lr_values[i]:.1e}' for i in tick_idx], rotation=45)
+    plt.colorbar(im2, ax=axes[1], label='Loss')
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "critical_lr_basin_map.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Box-counting dimension of the boundary
+    # ========================================
+    def box_counting_boundary(grid, resolutions):
+        """
+        Count boxes containing BOTH stable (0) and diverged (2) outcomes.
+
+        Args:
+            grid: 2D array of outcomes (0=stable, 1=slow, 2=diverged)
+            resolutions: list of box sizes to try
+
+        Returns:
+            sizes, counts (arrays for log-log fit)
+        """
+        H, W = grid.shape
+        # Binary boundary: stable (0) vs not-stable (1 or 2)
+        binary = (grid >= 2).astype(int)
+        sizes = []
+        counts = []
+
+        for box_size in resolutions:
+            if box_size > min(H, W):
+                continue
+            n_boxes = 0
+            for i in range(0, H, box_size):
+                for j in range(0, W, box_size):
+                    box = binary[i:i+box_size, j:j+box_size]
+                    if box.size == 0:
+                        continue
+                    # Boundary box: contains both 0 and 1
+                    if np.any(box == 0) and np.any(box == 1):
+                        n_boxes += 1
+            if n_boxes > 0:
+                sizes.append(box_size)
+                counts.append(n_boxes)
+
+        return np.array(sizes), np.array(counts)
+
+    resolutions = [1, 2, 3, 4, 5, 8]
+    sizes, counts = box_counting_boundary(outcome_grid, resolutions)
+
+    if len(sizes) >= 3:
+        log_inv_size = np.log(1.0 / sizes)
+        log_counts = np.log(counts)
+        slope, intercept, r_value, p_value, std_err = stats.linregress(log_inv_size, log_counts)
+        D_box = slope
+
+        # Bootstrap CI
+        n_boot = 1000
+        D_boots = []
+        for _ in range(n_boot):
+            # Resample seed axis
+            seed_idx = np.random.randint(0, n_seeds, n_seeds)
+            grid_boot = outcome_grid[:, seed_idx]
+            s_b, c_b = box_counting_boundary(grid_boot, resolutions)
+            if len(s_b) >= 3:
+                sl, _, _, _, _ = stats.linregress(np.log(1.0/s_b), np.log(c_b))
+                D_boots.append(sl)
+        D_boots = np.array(D_boots)
+        ci_lo, ci_hi = np.percentile(D_boots, [2.5, 97.5])
+
+        print(f"\nBox-counting dimension D = {D_box:.3f} (95% CI: [{ci_lo:.3f}, {ci_hi:.3f}])")
+        print(f"R² = {r_value**2:.4f}, p = {p_value:.4e}")
+    else:
+        D_box = np.nan
+        ci_lo = ci_hi = np.nan
+        print("Not enough resolution levels for box-counting dimension")
+
+    # Plot 2: Box-counting log-log
+    fig, ax = plt.subplots(figsize=(8, 6))
+    if len(sizes) >= 3:
+        ax.plot(np.log(1.0/sizes), np.log(counts), 'ko', markersize=8, label='Data')
+        x_fit = np.linspace(np.log(1.0/sizes).min(), np.log(1.0/sizes).max(), 100)
+        ax.plot(x_fit, slope * x_fit + intercept, 'r-', linewidth=2,
+                label=f'$D = {D_box:.3f}$ (95% CI: [{ci_lo:.3f}, {ci_hi:.3f}])')
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+        ax.set_xlabel('$\\ln(1/\\epsilon)$ (log inverse box size)')
+        ax.set_ylabel('$\\ln N(\\epsilon)$ (log boundary box count)')
+        ax.set_title(f'Box-Counting Dimension of Convergence Boundary\n'
+                     f'$D = {D_box:.3f}$, $R^2 = {r_value**2:.4f}$',
+                     fontsize=13, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "critical_lr_boundary_dimension.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # Save all results
+    save_data = {
+        "lr_values": lr_values, "outcome_grid": outcome_grid,
+        "final_loss_grid": final_loss_grid, "lr_critical": lr_critical,
+        "box_sizes": sizes, "box_counts": counts,
+        "D_box": D_box, "ci_lo": ci_lo, "ci_hi": ci_hi,
+    }
+    try:
+        if len(D_boots) > 0:
+            save_data["D_bootstrap"] = D_boots
+    except NameError:
+        pass
+
+    npz_path = os.path.join(PLOTS_DIR, "critical_lr_data.npz")
+    np.savez_compressed(npz_path, **save_data)
+    print(f"Saved: {npz_path}")
+
+
+# --- Experiment 22: Connectivity vs Confinement ---
+
+def exp_connectivity_confinement():
+    """
+    Mode connectivity and local confinement analysis.
+
+    Methodology (ArXiv-grade):
+    ──────────────────────────
+    Given two independently trained models θ_A, θ_B (same architecture, different seeds),
+    we measure:
+
+    1. Linear interpolation barrier:
+       L(t) = loss((1-t)θ_A + tθ_B) for t ∈ [0, 1]
+       Barrier = max_t L(t) - max(L(0), L(1))
+       If barrier ≈ 0, models are linearly connected (rare for non-trivial nets).
+
+    2. Quadratic Bezier path (Garipov et al. 2018):
+       θ(t) = (1-t)²θ_A + 2t(1-t)θ_mid + t²θ_B
+       Optimize θ_mid to minimize max_t L(θ(t)). We test 5 candidates.
+
+    3. Local curvature (Hessian trace estimate):
+       Tr(H) ≈ (1/k) Σᵢ [L(θ+εdᵢ) + L(θ-εdᵢ) - 2L(θ)] / ε²
+       using k=20 random unit directions dᵢ. Higher → sharper minimum.
+
+    4. Noise sensitivity:
+       L(θ + σ·z) for z ~ N(0, I), σ ∈ logspace(-3, 0, 20)
+       Sharp minima show rapid loss increase with σ.
+
+    5. SWA control: stochastic weight averaging (Izmailov et al. 2018)
+       Average last 5 checkpoints → flatter minimum → compare curvature.
+
+    Outputs:
+      - plots/connectivity_interpolation.png
+      - plots/connectivity_curved.png
+      - plots/confinement_curvature.png
+      - plots/confinement_noise.png
+      - plots/connectivity_data.npz
+
+    Requires: pre-trained model pairs. Uses existing checkpoints for one model,
+              trains additional seeds via train_sweep.py.
+    """
+    from train_sweep import train_seeded
+
+    data_path = os.path.join(PLOTS_DIR, "connectivity_data.npz")
+
+    # --- get or train model pairs ---
+    checkpoints = get_checkpoints()
+
+    # Model A: existing trained model (seed implicit)
+    model_A = load_checkpoint(checkpoints[-1])
+    params_A = get_flat_params(model_A)
+
+    # Model B: train with different seed
+    ckpt_dir_B = os.path.join(os.path.dirname(__file__), "checkpoints_connectivity_B")
+    ckpt_path_B = os.path.join(ckpt_dir_B, "step_010000.pt")
+
+    if os.path.exists(ckpt_path_B):
+        print("Loading pre-trained model B...")
+        model_B = load_checkpoint(ckpt_path_B)
+    else:
+        print("Training model B (seed=7, ~15 min)...")
+        r = train_seeded(seed=7, lr=3e-4, max_steps=10000,
+                         n_layer=N_LAYER, n_embd=N_EMBD, n_head=N_EMBD // 32,
+                         save_checkpoints=True, ckpt_dir=ckpt_dir_B)
+        model_B = load_checkpoint(ckpt_path_B)
+
+    params_B = get_flat_params(model_B)
+
+    # SWA model: average last 5 checkpoints of model A
+    swa_ckpts = checkpoints[-5:]
+    swa_state = None
+    for cp in swa_ckpts:
+        m = load_checkpoint(cp)
+        if swa_state is None:
+            swa_state = {k: v.clone().float() for k, v in m.state_dict().items()}
+        else:
+            for k, v in m.state_dict().items():
+                swa_state[k] += v.float()
+    for k in swa_state:
+        swa_state[k] /= len(swa_ckpts)
+    model_SWA = GPT()
+    model_SWA.load_state_dict(swa_state)
+    model_SWA.eval()
+    params_SWA = get_flat_params(model_SWA)
+
+    loss_A = compute_loss_batched(model_A)
+    loss_B = compute_loss_batched(model_B)
+    loss_SWA = compute_loss_batched(model_SWA)
+    print(f"Loss A: {loss_A:.4f}, Loss B: {loss_B:.4f}, Loss SWA: {loss_SWA:.4f}")
+
+    # --- 1. Linear interpolation ---
+    print("\n1. Linear interpolation barrier...")
+    n_points = 51
+    ts = np.linspace(0, 1, n_points)
+    losses_linear = []
+
+    for t in ts:
+        params_t = (1 - t) * params_A + t * params_B
+        set_model_params(model_A, params_t)
+        loss_t = compute_loss_batched(model_A, n_batches=3)
+        losses_linear.append(loss_t)
+
+    set_model_params(model_A, params_A)  # restore
+    losses_linear = np.array(losses_linear)
+    barrier_linear = np.max(losses_linear) - max(loss_A, loss_B)
+    print(f"Linear barrier: {barrier_linear:.4f} (max={np.max(losses_linear):.4f})")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(ts, losses_linear, 'b-', linewidth=2, label='Linear interpolation')
+    ax.axhline(loss_A, color='green', linestyle='--', alpha=0.7, label=f'Model A ({loss_A:.3f})')
+    ax.axhline(loss_B, color='red', linestyle='--', alpha=0.7, label=f'Model B ({loss_B:.3f})')
+    ax.set_xlabel('$t$ (interpolation parameter)')
+    ax.set_ylabel('Loss')
+    ax.set_title(f'Linear Interpolation: $\\theta(t) = (1-t)\\theta_A + t\\theta_B$\n'
+                 f'Barrier = {barrier_linear:.4f}', fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "connectivity_interpolation.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # --- 2. Quadratic Bezier path ---
+    print("\n2. Curved (Bezier) path...")
+    midpoint = (params_A + params_B) / 2
+
+    # 5 candidate midpoints
+    torch.manual_seed(42)
+    candidates = [midpoint]
+    for _ in range(4):
+        # midpoint + small perturbation in a random direction
+        noise = torch.randn_like(midpoint)
+        noise = noise / noise.norm() * params_A.norm() * 0.01
+        candidates.append(midpoint + noise)
+
+    best_max_loss = np.inf
+    best_losses = None
+    best_idx = 0
+
+    for ci, mid_candidate in enumerate(candidates):
+        bezier_losses = []
+        for t in ts:
+            params_t = (1-t)**2 * params_A + 2*t*(1-t) * mid_candidate + t**2 * params_B
+            set_model_params(model_A, params_t)
+            loss_t = compute_loss_batched(model_A, n_batches=3)
+            bezier_losses.append(loss_t)
+        max_loss = max(bezier_losses)
+        if max_loss < best_max_loss:
+            best_max_loss = max_loss
+            best_losses = bezier_losses
+            best_idx = ci
+
+    set_model_params(model_A, params_A)  # restore
+    barrier_bezier = best_max_loss - max(loss_A, loss_B)
+    print(f"Best Bezier barrier: {barrier_bezier:.4f} (candidate {best_idx})")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(ts, losses_linear, 'b-', linewidth=2, alpha=0.5, label=f'Linear (barrier={barrier_linear:.3f})')
+    ax.plot(ts, best_losses, 'r-', linewidth=2, label=f'Bezier (barrier={barrier_bezier:.3f})')
+    ax.axhline(loss_A, color='green', linestyle='--', alpha=0.5, label=f'A ({loss_A:.3f})')
+    ax.axhline(loss_B, color='orange', linestyle='--', alpha=0.5, label=f'B ({loss_B:.3f})')
+    ax.set_xlabel('$t$')
+    ax.set_ylabel('Loss')
+    ax.set_title('Linear vs Bezier Interpolation Path', fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "connectivity_curved.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # --- 3. Local curvature ---
+    print("\n3. Local curvature estimation...")
+    n_dirs = 20
+    eps = 1e-3
+
+    def estimate_curvature(model, params, n_dirs=20, eps_per_param=1e-3):
+        """
+        Estimate sharpness via finite differences in random directions.
+
+        Rather than Tr(H)/ε² (scale-dependent), we report the average loss
+        change under unit-variance Gaussian noise scaled by eps_per_param:
+            sharpness = mean_d [ L(θ + ε·d) - L(θ) ]
+        where d ~ N(0, I) and ε = eps_per_param.
+        This is equivalent to the "expected sharpness" metric (Keskar et al. 2017).
+        """
+        torch.manual_seed(123)
+        base_loss = compute_loss_batched(model, n_batches=5)
+        loss_deltas = []
+        for _ in range(n_dirs):
+            d = torch.randn_like(params) * eps_per_param
+            set_model_params(model, params + d)
+            loss_plus = compute_loss_batched(model, n_batches=5)
+            loss_deltas.append(loss_plus - base_loss)
+        set_model_params(model, params)  # restore
+        print(f"    eps_per_param={eps_per_param}, base_loss={base_loss:.4f}, "
+              f"mean_delta={np.mean(loss_deltas):.4f}")
+        return base_loss, np.array(loss_deltas)
+
+    loss_A_curv, curvs_A = estimate_curvature(model_A, params_A)
+    loss_B_curv, curvs_B = estimate_curvature(model_B, params_B)
+    loss_SWA_curv, curvs_SWA = estimate_curvature(model_SWA, params_SWA)
+
+    print(f"Sharpness (ΔL under noise): A={np.mean(curvs_A):.4f}±{np.std(curvs_A):.4f}, "
+          f"B={np.mean(curvs_B):.4f}±{np.std(curvs_B):.4f}, "
+          f"SWA={np.mean(curvs_SWA):.4f}±{np.std(curvs_SWA):.4f}")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    labels = ['Model A', 'Model B', 'SWA']
+    means = [np.mean(curvs_A), np.mean(curvs_B), np.mean(curvs_SWA)]
+    stds = [np.std(curvs_A), np.std(curvs_B), np.std(curvs_SWA)]
+    colors = ['steelblue', 'coral', 'seagreen']
+    bars = ax.bar(labels, means, yerr=stds, color=colors, alpha=0.8, capsize=5)
+    ax.set_ylabel('$\\Delta L$ (expected sharpness)')
+    ax.set_title('Expected Sharpness: Standard Training vs SWA\n'
+                 '(higher = sharper minimum)', fontsize=13, fontweight='bold')
+    ax.grid(alpha=0.3, axis='y')
+    for bar, m, s in zip(bars, means, stds):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + s + max(abs(m)*0.1, 0.001),
+                f'{m:.4f}', ha='center', fontsize=10)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "confinement_curvature.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # --- 4. Noise sensitivity ---
+    print("\n4. Noise sensitivity...")
+    sigmas = np.logspace(-2, 1, 20)  # relative to ‖θ‖/√d
+
+    def noise_sensitivity(model, params, rel_sigmas, n_samples=3):
+        """
+        Evaluate loss under Gaussian noise of increasing relative magnitude.
+        σ_absolute = rel_sigma × ‖θ‖ × (noise / ‖noise‖) scaled per-element.
+        """
+        torch.manual_seed(999)
+        param_norm = params.norm().item()
+        losses = []
+        for rel_sigma in rel_sigmas:
+            sigma = rel_sigma * param_norm / np.sqrt(params.numel())
+            sample_losses = []
+            for _ in range(n_samples):
+                noise = torch.randn_like(params) * sigma
+                set_model_params(model, params + noise)
+                l = compute_loss_batched(model, n_batches=3)
+                sample_losses.append(l)
+            losses.append(np.mean(sample_losses))
+        set_model_params(model, params)  # restore
+        return np.array(losses)
+
+    noise_A = noise_sensitivity(model_A, params_A, sigmas)
+    noise_B = noise_sensitivity(model_B, params_B, sigmas)
+    noise_SWA = noise_sensitivity(model_SWA, params_SWA, sigmas)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(sigmas, noise_A, 'o-', color='steelblue', label='Model A', linewidth=2)
+    ax.plot(sigmas, noise_B, 'o-', color='coral', label='Model B', linewidth=2)
+    ax.plot(sigmas, noise_SWA, 's-', color='seagreen', label='SWA', linewidth=2)
+    ax.set_xscale('log')
+    ax.set_xlabel('$\\sigma$ (noise magnitude)')
+    ax.set_ylabel('Loss')
+    ax.set_title('Noise Sensitivity: $L(\\theta + \\sigma z)$, $z \\sim \\mathcal{N}(0, I)$\n'
+                 'Sharp minima degrade faster', fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "confinement_noise.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # Save all data
+    np.savez_compressed(os.path.join(PLOTS_DIR, "connectivity_data.npz"),
+                        ts=ts, losses_linear=losses_linear,
+                        losses_bezier=np.array(best_losses),
+                        barrier_linear=barrier_linear, barrier_bezier=barrier_bezier,
+                        loss_A=loss_A, loss_B=loss_B, loss_SWA=loss_SWA,
+                        curvature_A=curvs_A, curvature_B=curvs_B, curvature_SWA=curvs_SWA,
+                        sigmas=sigmas, noise_A=noise_A, noise_B=noise_B, noise_SWA=noise_SWA)
+    print(f"Saved: {os.path.join(PLOTS_DIR, 'connectivity_data.npz')}")
+
+
+# --- Experiment 23: Seed Identity Persistence ---
+
+def exp_seed_persistence():
+    """
+    Test whether initialization seeds leave persistent fingerprints after training.
+
+    Methodology (ArXiv-grade):
+    ──────────────────────────
+    Hypothesis: random initialization creates a unique "signature" in the weight space
+    that persists even after extensive training, detectable via spectral features.
+
+    Protocol:
+      1. Train 20 models with seeds 0-19 (small model, 3L/96d, 10k steps each)
+      2. At each checkpoint, extract a feature vector:
+         - Top-10 normalized singular values per weight matrix
+         - Frobenius norm per weight matrix
+         - Spectral gap (σ₁ - σ₂) per weight matrix
+      3. Train a nearest-centroid classifier (scipy, no sklearn):
+         - Training set: even-numbered checkpoints
+         - Test set: odd-numbered checkpoints
+         - 20-way classification → chance = 5%
+      4. Track classification accuracy vs training step
+
+    Controls:
+      - Random labels: permute seed assignments → should get ~5%
+      - Permutation test (100×): null distribution of accuracy
+
+    Outputs:
+      - plots/seed_persistence_accuracy.png
+      - plots/seed_persistence_features.png
+      - plots/seed_persistence_data.npz
+
+    Requires: train 20 seeds first. Run:
+      for i in $(seq 0 19); do uv run train_sweep.py --seed $i; done
+    Or this function runs inline.
+    """
+    from train_sweep import train_seeded
+    from scipy.spatial.distance import cdist
+
+    seed_dir = os.path.join(os.path.dirname(__file__), "checkpoints_seeds")
+    n_seeds = 20
+    n_layer, n_embd, n_head = 3, 96, 3
+
+    # Check if training is done
+    all_exist = all(
+        os.path.exists(os.path.join(seed_dir, f"seed_{s}", "step_010000.pt"))
+        for s in range(n_seeds)
+    )
+
+    if not all_exist:
+        print(f"Training {n_seeds} seeds (small model, ~8 min each, ~2.7hr total)...")
+        for s in range(n_seeds):
+            ckpt_dir_s = os.path.join(seed_dir, f"seed_{s}")
+            if os.path.exists(os.path.join(ckpt_dir_s, "step_010000.pt")):
+                print(f"  seed {s}: already done, skipping")
+                continue
+            print(f"  Training seed {s}/{n_seeds}...")
+            train_seeded(seed=s, lr=3e-4, max_steps=10000,
+                         n_layer=n_layer, n_embd=n_embd, n_head=n_head,
+                         save_checkpoints=True, ckpt_dir=ckpt_dir_s,
+                         ckpt_interval=500, quiet=True)
+
+    # --- feature extraction ---
+    print("Extracting spectral features...")
+
+    steps = list(range(0, 10001, 500))  # 21 checkpoints
+    # features[seed][step_idx] = feature vector
+    features = {}
+
+    for s in range(n_seeds):
+        features[s] = {}
+        for si, step in enumerate(steps):
+            ckpt_path = os.path.join(seed_dir, f"seed_{s}", f"step_{step:06d}.pt")
+            if not os.path.exists(ckpt_path):
+                continue
+            model = load_checkpoint_scaled(ckpt_path, n_layer, n_embd, n_head)
+            matrices = get_weight_matrices(model)
+
+            feat = []
+            for name, W in matrices.items():
+                S = np.linalg.svd(W, compute_uv=False)
+                # Normalized top-10 singular values
+                S_norm = S / (np.linalg.norm(S) + 1e-10)
+                feat.extend(S_norm[:min(10, len(S))])
+                # Frobenius norm
+                feat.append(np.linalg.norm(W))
+                # Spectral gap
+                if len(S) >= 2:
+                    feat.append(S[0] - S[1])
+                else:
+                    feat.append(0.0)
+
+            features[s][si] = np.array(feat)
+
+    n_features = len(features[0][0])
+    print(f"Feature vector dimension: {n_features}")
+
+    # --- classification ---
+    print("Running nearest-centroid classification...")
+
+    # Split: even step indices for train, odd for test
+    train_idx = list(range(0, len(steps), 2))
+    test_idx = list(range(1, len(steps), 2))
+
+    # For each test checkpoint, classify seed identity
+    accuracy_per_step = {}
+
+    for si in test_idx:
+        if si >= len(steps):
+            continue
+        step = steps[si]
+
+        # Compute centroids from training checkpoints
+        centroids = []
+        for s in range(n_seeds):
+            train_feats = [features[s][ti] for ti in train_idx if ti in features[s]]
+            if train_feats:
+                centroids.append(np.mean(train_feats, axis=0))
+            else:
+                centroids.append(np.zeros(n_features))
+        centroids = np.array(centroids)  # [n_seeds, n_features]
+
+        # Classify test features
+        test_feats = []
+        test_labels = []
+        for s in range(n_seeds):
+            if si in features[s]:
+                test_feats.append(features[s][si])
+                test_labels.append(s)
+
+        if not test_feats:
+            continue
+
+        test_feats = np.array(test_feats)
+        test_labels = np.array(test_labels)
+
+        # Nearest centroid
+        dists = cdist(test_feats, centroids, metric='euclidean')
+        preds = np.argmin(dists, axis=1)
+        acc = np.mean(preds == test_labels)
+        accuracy_per_step[step] = acc
+
+    # Permutation test (null distribution)
+    print("Running permutation test (100 iterations)...")
+    n_perm = 100
+    perm_accs = []
+    rng = np.random.RandomState(42)
+
+    for _ in range(n_perm):
+        # Shuffle seed labels
+        perm = rng.permutation(n_seeds)
+        perm_acc_per_step = []
+
+        for si in test_idx:
+            if si >= len(steps):
+                continue
+            step = steps[si]
+
+            # Centroids with permuted labels
+            centroids = []
+            for s in range(n_seeds):
+                orig_s = perm[s]
+                train_feats = [features[orig_s][ti] for ti in train_idx if ti in features[orig_s]]
+                if train_feats:
+                    centroids.append(np.mean(train_feats, axis=0))
+                else:
+                    centroids.append(np.zeros(n_features))
+            centroids = np.array(centroids)
+
+            test_feats = []
+            test_labels = []
+            for s in range(n_seeds):
+                if si in features[s]:
+                    test_feats.append(features[s][si])
+                    test_labels.append(s)
+
+            if not test_feats:
+                continue
+
+            test_feats = np.array(test_feats)
+            test_labels = np.array(test_labels)
+            dists = cdist(test_feats, centroids, metric='euclidean')
+            preds = np.argmin(dists, axis=1)
+            perm_acc_per_step.append(np.mean(preds == test_labels))
+
+        perm_accs.append(np.mean(perm_acc_per_step) if perm_acc_per_step else 0)
+
+    perm_ci = np.percentile(perm_accs, [2.5, 97.5])
+    chance = 1.0 / n_seeds
+
+    print(f"\nAccuracy per step:")
+    for step, acc in sorted(accuracy_per_step.items()):
+        print(f"  step {step:5d}: {acc:.1%}")
+    print(f"Chance level: {chance:.1%}")
+    print(f"Permutation null: {np.mean(perm_accs):.1%} (95% CI: [{perm_ci[0]:.1%}, {perm_ci[1]:.1%}])")
+
+    # ========================================
+    # Plot 1: Accuracy over training
+    # ========================================
+    sorted_steps = sorted(accuracy_per_step.keys())
+    sorted_accs = [accuracy_per_step[s] for s in sorted_steps]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(sorted_steps, sorted_accs, 'o-', color='coral', linewidth=2, markersize=6,
+            label='Nearest centroid accuracy')
+    ax.axhline(chance, color='gray', linestyle='--', linewidth=1.5, label=f'Chance ({chance:.0%})')
+    ax.fill_between([sorted_steps[0], sorted_steps[-1]], perm_ci[0], perm_ci[1],
+                    color='gray', alpha=0.2, label='Permutation 95% CI')
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Classification Accuracy')
+    ax.set_title(f'Seed Identity Persistence: Can We Identify Initialization Seed?\n'
+                 f'{n_seeds} seeds, {n_layer}L/{n_embd}d model',
+                 fontsize=13, fontweight='bold')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.set_ylim(0, 1.05)
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "seed_persistence_accuracy.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # ========================================
+    # Plot 2: PCA of features colored by seed
+    # ========================================
+    # Show init (step 0), mid (step 5000), and final (step 10000)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle('Feature Space (PCA) Colored by Seed', fontsize=14, fontweight='bold')
+
+    for ax, (target_step, label) in zip(axes, [(0, 'Init'), (10, 'Mid (5000)'), (20, 'Final (10000)')]):
+        all_feats = []
+        all_seeds = []
+        for s in range(n_seeds):
+            if target_step in features[s]:
+                all_feats.append(features[s][target_step])
+                all_seeds.append(s)
+
+        if len(all_feats) < 3:
+            ax.text(0.5, 0.5, 'Insufficient data', transform=ax.transAxes, ha='center')
+            continue
+
+        all_feats = np.array(all_feats)
+        all_seeds = np.array(all_seeds)
+
+        # Simple PCA via SVD
+        feats_centered = all_feats - all_feats.mean(axis=0)
+        U, S_pca, Vt = np.linalg.svd(feats_centered, full_matrices=False)
+        coords = feats_centered @ Vt[:2].T
+        var_explained = S_pca[:2]**2 / np.sum(S_pca**2) * 100
+
+        scatter = ax.scatter(coords[:, 0], coords[:, 1], c=all_seeds,
+                            cmap='tab20', s=60, alpha=0.8, edgecolors='white', linewidth=0.5)
+        ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}%)')
+        ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}%)')
+        ax.set_title(label)
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "seed_persistence_features.png")
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+    # Save data
+    save_dict = {
+        "steps": np.array(sorted_steps),
+        "accuracy": np.array(sorted_accs),
+        "chance": chance,
+        "perm_accs": np.array(perm_accs),
+        "perm_ci": perm_ci,
+        "n_seeds": n_seeds,
+        "n_features": n_features,
+    }
+    np.savez_compressed(os.path.join(PLOTS_DIR, "seed_persistence_data.npz"), **save_dict)
+    print(f"Saved: {os.path.join(PLOTS_DIR, 'seed_persistence_data.npz')}")
+
+
 # --- registry ---
 
 EXPERIMENTS = {
@@ -2062,6 +3694,11 @@ EXPERIMENTS = {
     "grad_fractals": exp_gradient_fractals,
     "init_vs_trained": exp_init_vs_trained,
     "scale": exp_scale_comparison,
+    "rmt_denoised": exp_rmt_denoised,
+    "attn_graph": exp_attn_graph_spectral,
+    "critical_lr": exp_critical_lr,
+    "connectivity": exp_connectivity_confinement,
+    "seed_persist": exp_seed_persistence,
 }
 
 
