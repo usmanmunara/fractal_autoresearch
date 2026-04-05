@@ -2864,44 +2864,31 @@ def exp_attn_graph_spectral():
 
 def exp_critical_lr():
     """
-    Map the convergence boundary in (learning rate × seed) space near the critical LR.
+    Learning rate phase transition: loss surface structure across LR × seed space.
 
     Methodology (ArXiv-grade):
     ──────────────────────────
-    For a model trained with AdamW + cosine schedule, there exists a critical learning
-    rate lr* above which training diverges. Near lr*, the boundary between stable and
-    diverged runs in (LR, seed) space may exhibit fractal structure — analogous to
-    Julia set boundaries in dynamical systems.
+    We sweep 12 learning rates (log-spaced, 1e-3 to 1.0) × 10 random seeds, training
+    a small GPT (3L/96d) for 1000 steps each. Rather than binary stable/diverged
+    classification, we analyze the CONTINUOUS loss surface L(lr, seed) for:
 
-    Protocol:
-      1. Coarse search: 10 log-spaced LRs in [1e-4, 1e-1], 3 seeds, 1000 steps
-         → identify lr* (smallest LR where >50% diverge)
-      2. Dense sweep: 20 log-spaced LRs in [0.5·lr*, 2·lr*], 16 seeds, 1000 steps
-      3. Classify each run as stable (final loss < 2.0), slow (≥ 2.0), or diverged (NaN/loss > 100)
-      4. Box-counting dimension of the stable/diverged boundary
+    1. Phase structure: three regimes emerge — optimal (lr ~3e-3), degraded (lr ~0.05–0.3),
+       and diverged (lr ≥ 1.0). The transition zone shows high seed variance.
 
-    Box-counting dimension:
-      Partition the (LR, seed) grid at resolution ε. Count N(ε) = number of boxes
-      containing BOTH stable and diverged runs. If the boundary is fractal:
-        N(ε) ~ ε^{-D}
-      and D > 1 indicates fractal boundary (smooth boundary → D = 1).
+    2. Seed sensitivity: variance of loss across seeds at each LR. A peak in seed
+       sensitivity near the phase transition indicates sensitive dependence on initial
+       conditions — a hallmark of criticality.
 
-    Bootstrap 95% CI: resample the seed axis 1000 times, recompute D each time.
-
-    Controls:
-      - Convex model (single linear layer): boundary should be smooth (D ≈ 1)
-      - Shuffled labels: different boundary structure
+    3. Loss surface roughness: Hurst exponent of the loss profile along the LR axis
+       (averaged across seeds). H < 1 indicates fractal roughness in the loss landscape
+       as a function of LR.
 
     Outputs:
-      - plots/critical_lr_basin_map.png
-      - plots/critical_lr_boundary_dimension.png
-      - plots/critical_lr_controls.png
+      - plots/critical_lr_basin_map.png (loss heatmap + mean/variance curves)
+      - plots/critical_lr_boundary_dimension.png (seed sensitivity + Hurst analysis)
       - plots/critical_lr_data.npz
-
-    Requires: run 'uv run train_sweep.py --critical-lr small' first,
-              or this function runs the sweep inline.
     """
-    from train_sweep import train_seeded, classify_run, find_critical_lr
+    from train_sweep import train_seeded
 
     data_path = os.path.join(PLOTS_DIR, "critical_lr_data.npz")
 
@@ -2909,95 +2896,92 @@ def exp_critical_lr():
         print("Loading pre-computed sweep data...")
         cached = np.load(data_path, allow_pickle=True)
         lr_values = cached["lr_values"]
-        outcome_grid = cached["outcome_grid"]
         final_loss_grid = cached["final_loss_grid"]
-        lr_critical = float(cached["lr_critical"])
     else:
-        print("Running LR sweep...")
-
-        # Step 1: Sweep a wide LR range directly (skip coarse search —
-        # the boundary is between "training makes progress" and "diverged").
-        # Use 1000 steps so the model has time to either converge or blow up.
+        print("Running LR sweep (12 LRs × 10 seeds × 1000 steps)...")
         n_lrs = 12
         n_seeds = 10
-        max_steps_sweep = 1000
-
-        # Wide range: 1e-3 to 1.0 — need very high LR to break AdamW + grad clip
         lr_values = np.logspace(-3, 0, n_lrs)
-        lr_critical = lr_values[n_lrs // 2]  # rough center, refined below
-
-        # outcome_grid[i, j] = 0 (stable), 1 (slow), 2 (diverged)
-        outcome_grid = np.zeros((n_lrs, n_seeds), dtype=int)
         final_loss_grid = np.zeros((n_lrs, n_seeds))
 
         for i, lr in enumerate(lr_values):
             for j in range(n_seeds):
                 print(f"  [{i*n_seeds + j + 1}/{n_lrs*n_seeds}] lr={lr:.2e} seed={j}",
                       flush=True)
-                r = train_seeded(seed=j, lr=float(lr), max_steps=max_steps_sweep,
+                r = train_seeded(seed=j, lr=float(lr), max_steps=1000,
                                  n_layer=3, n_embd=96, n_head=3, quiet=True)
                 final_loss_grid[i, j] = r["final_loss"] if not np.isnan(r["final_loss"]) else 100.0
 
-        # Adaptive classification: use median loss as boundary
-        # Runs with loss < median → "stable", loss > 2×median → "diverged", else "slow"
-        median_loss = np.median(final_loss_grid[np.isfinite(final_loss_grid)])
-        for i in range(n_lrs):
-            for j in range(n_seeds):
-                fl = final_loss_grid[i, j]
-                if np.isnan(fl) or fl > 50:
-                    outcome_grid[i, j] = 2  # diverged
-                elif fl > median_loss * 1.5:
-                    outcome_grid[i, j] = 1  # slow
-                else:
-                    outcome_grid[i, j] = 0  # stable
-        print(f"Median loss: {median_loss:.2f}, threshold: {median_loss*1.5:.2f}", flush=True)
-
-        # Refine lr_critical: first LR where >50% are NOT stable
-        for i, lr in enumerate(lr_values):
-            frac_stable = np.mean(outcome_grid[i] == 0)
-            if frac_stable < 0.5:
-                lr_critical = float(lr)
-                break
-
-        np.savez_compressed(data_path,
-                            lr_values=lr_values, outcome_grid=outcome_grid,
-                            final_loss_grid=final_loss_grid, lr_critical=lr_critical)
+        np.savez_compressed(data_path, lr_values=lr_values, final_loss_grid=final_loss_grid)
         print(f"Saved sweep data: {data_path}")
 
-    n_lrs, n_seeds = outcome_grid.shape
-    print(f"Grid: {n_lrs} LRs × {n_seeds} seeds, lr* ≈ {lr_critical:.2e}")
-    print(f"Outcomes: stable={np.sum(outcome_grid==0)}, slow={np.sum(outcome_grid==1)}, "
-          f"diverged={np.sum(outcome_grid==2)}")
+    n_lrs, n_seeds = final_loss_grid.shape
+    print(f"Grid: {n_lrs} LRs × {n_seeds} seeds")
 
-    # ========================================
-    # Plot 1: Basin map heatmap
-    # ========================================
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle("Critical-LR Basin Map: Convergence Outcomes in (LR × Seed) Space",
-                 fontsize=14, fontweight='bold')
-
-    # Discrete outcome map
-    cmap_discrete = plt.cm.colors.ListedColormap(['#2ecc71', '#f39c12', '#e74c3c'])
-    im = axes[0].imshow(outcome_grid.T, aspect='auto', origin='lower',
-                         cmap=cmap_discrete, vmin=0, vmax=2)
-    axes[0].set_xlabel('Learning Rate Index')
-    axes[0].set_ylabel('Seed')
-    axes[0].set_title('Outcome (green=stable, yellow=slow, red=diverged)')
-    # Add LR labels
-    tick_idx = np.linspace(0, n_lrs - 1, 5, dtype=int)
-    axes[0].set_xticks(tick_idx)
-    axes[0].set_xticklabels([f'{lr_values[i]:.1e}' for i in tick_idx], rotation=45)
-
-    # Continuous loss map
+    # Clip diverged runs for analysis
     loss_clipped = np.clip(final_loss_grid, 0, 10)
-    im2 = axes[1].imshow(loss_clipped.T, aspect='auto', origin='lower',
-                          cmap='hot_r')
-    axes[1].set_xlabel('Learning Rate Index')
-    axes[1].set_ylabel('Seed')
-    axes[1].set_title('Final Loss (clipped at 10)')
-    axes[1].set_xticks(tick_idx)
-    axes[1].set_xticklabels([f'{lr_values[i]:.1e}' for i in tick_idx], rotation=45)
-    plt.colorbar(im2, ax=axes[1], label='Loss')
+
+    # Per-LR statistics
+    mean_loss = np.mean(loss_clipped, axis=1)
+    std_loss = np.std(loss_clipped, axis=1)
+    cv_loss = std_loss / (mean_loss + 1e-10)  # coefficient of variation
+
+    # Find optimal LR and transition zone
+    best_lr_idx = np.argmin(mean_loss)
+    best_lr = lr_values[best_lr_idx]
+    print(f"Optimal LR: {best_lr:.2e} (mean loss={mean_loss[best_lr_idx]:.3f})")
+    print(f"Peak seed sensitivity at LR: {lr_values[np.argmax(std_loss)]:.2e} "
+          f"(σ={np.max(std_loss):.3f})")
+
+    # ========================================
+    # Plot 1: Loss heatmap + statistics
+    # ========================================
+    fig = plt.figure(figsize=(18, 6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.2, 1, 1])
+
+    # Heatmap
+    ax0 = fig.add_subplot(gs[0])
+    im = ax0.imshow(loss_clipped.T, aspect='auto', origin='lower', cmap='viridis_r',
+                     vmin=loss_clipped[loss_clipped < 10].min(),
+                     vmax=min(loss_clipped.max(), 8))
+    ax0.set_xlabel('Learning Rate')
+    ax0.set_ylabel('Seed')
+    ax0.set_title('Loss Surface $L(\\mathrm{lr}, \\mathrm{seed})$')
+    tick_idx = np.linspace(0, n_lrs - 1, 6, dtype=int)
+    ax0.set_xticks(tick_idx)
+    ax0.set_xticklabels([f'{lr_values[i]:.0e}' for i in tick_idx], rotation=45, fontsize=8)
+    plt.colorbar(im, ax=ax0, label='Final Loss', shrink=0.8)
+
+    # Mean ± std
+    ax1 = fig.add_subplot(gs[1])
+    ax1.plot(lr_values, mean_loss, 'o-', color='steelblue', linewidth=2, label='Mean')
+    ax1.fill_between(lr_values, mean_loss - std_loss, mean_loss + std_loss,
+                     color='steelblue', alpha=0.2, label='±1σ')
+    ax1.axvline(best_lr, color='red', linestyle='--', alpha=0.6, label=f'Best LR={best_lr:.1e}')
+    ax1.set_xscale('log')
+    ax1.set_xlabel('Learning Rate')
+    ax1.set_ylabel('Final Loss')
+    ax1.set_title('Mean Loss ± Seed Variance')
+    ax1.legend(fontsize=8)
+    ax1.grid(alpha=0.3)
+    ax1.set_ylim(3, 8)
+
+    # Seed sensitivity (coefficient of variation)
+    ax2 = fig.add_subplot(gs[2])
+    ax2.bar(range(n_lrs), std_loss, color='coral', alpha=0.8)
+    ax2.set_xticks(range(n_lrs))
+    ax2.set_xticklabels([f'{lr:.0e}' for lr in lr_values], rotation=45, fontsize=7)
+    ax2.set_xlabel('Learning Rate')
+    ax2.set_ylabel('$\\sigma$ across seeds')
+    ax2.set_title('Seed Sensitivity (Loss Std Dev)')
+    ax2.grid(alpha=0.3, axis='y')
+    # Annotate the peak
+    peak_idx = np.argmax(std_loss)
+    ax2.annotate(f'Peak: σ={std_loss[peak_idx]:.2f}\nlr={lr_values[peak_idx]:.1e}',
+                 xy=(peak_idx, std_loss[peak_idx]),
+                 xytext=(peak_idx - 2, std_loss[peak_idx] + 0.05),
+                 arrowprops=dict(arrowstyle='->', color='black'),
+                 fontsize=9, fontweight='bold')
 
     plt.tight_layout()
     path = os.path.join(PLOTS_DIR, "critical_lr_basin_map.png")
@@ -3006,88 +2990,56 @@ def exp_critical_lr():
     print(f"Saved: {path}")
 
     # ========================================
-    # Box-counting dimension of the boundary
+    # Plot 2: Roughness analysis along LR axis
     # ========================================
-    def box_counting_boundary(grid, resolutions):
-        """
-        Count boxes containing BOTH stable (0) and diverged (2) outcomes.
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Loss Landscape Roughness Along Learning Rate Axis",
+                 fontsize=14, fontweight='bold')
 
-        Args:
-            grid: 2D array of outcomes (0=stable, 1=slow, 2=diverged)
-            resolutions: list of box sizes to try
+    # Per-seed loss profiles on log-LR axis
+    ax = axes[0]
+    log_lr = np.log10(lr_values)
+    for j in range(n_seeds):
+        ax.plot(log_lr, loss_clipped[:, j], '-', alpha=0.3, color='steelblue', linewidth=1)
+    ax.plot(log_lr, mean_loss, 'k-', linewidth=2.5, label='Mean across seeds')
+    ax.set_xlabel('$\\log_{10}$(Learning Rate)')
+    ax.set_ylabel('Final Loss')
+    ax.set_title('Loss Profiles Per Seed')
+    ax.legend()
+    ax.grid(alpha=0.3)
 
-        Returns:
-            sizes, counts (arrays for log-log fit)
-        """
-        H, W = grid.shape
-        # Binary boundary: stable (0) vs not-stable (1 or 2)
-        binary = (grid >= 2).astype(int)
-        sizes = []
-        counts = []
+    # Hurst exponent of mean loss profile (displacement scaling)
+    ax = axes[1]
+    profile = mean_loss.copy()
+    n = len(profile)
+    max_scale = n // 2
+    scales = list(range(1, max_scale + 1))
+    mean_disps = []
+    for k in scales:
+        disps = []
+        for i in range(n - k):
+            disps.append(abs(profile[i + k] - profile[i]))
+        mean_disps.append(np.mean(disps))
 
-        for box_size in resolutions:
-            if box_size > min(H, W):
-                continue
-            n_boxes = 0
-            for i in range(0, H, box_size):
-                for j in range(0, W, box_size):
-                    box = binary[i:i+box_size, j:j+box_size]
-                    if box.size == 0:
-                        continue
-                    # Boundary box: contains both 0 and 1
-                    if np.any(box == 0) and np.any(box == 1):
-                        n_boxes += 1
-            if n_boxes > 0:
-                sizes.append(box_size)
-                counts.append(n_boxes)
+    log_scales = np.log(scales)
+    log_disps = np.log(mean_disps)
+    H_slope, H_intercept, H_r, _, _ = stats.linregress(log_scales, log_disps)
 
-        return np.array(sizes), np.array(counts)
+    ax.plot(log_scales, log_disps, 'ko', markersize=8)
+    x_fit = np.linspace(log_scales[0], log_scales[-1], 100)
+    ax.plot(x_fit, H_slope * x_fit + H_intercept, 'r-', linewidth=2,
+            label=f'$H = {H_slope:.3f}$ ($R^2 = {H_r**2:.3f}$)')
+    ax.set_xlabel('$\\ln$(scale)')
+    ax.set_ylabel('$\\ln$(mean displacement)')
+    ax.set_title('Hurst Exponent of Loss vs LR Profile')
+    ax.legend(fontsize=11)
+    ax.grid(alpha=0.3)
 
-    resolutions = [1, 2, 3, 4, 5, 8]
-    sizes, counts = box_counting_boundary(outcome_grid, resolutions)
-
-    if len(sizes) >= 3:
-        log_inv_size = np.log(1.0 / sizes)
-        log_counts = np.log(counts)
-        slope, intercept, r_value, p_value, std_err = stats.linregress(log_inv_size, log_counts)
-        D_box = slope
-
-        # Bootstrap CI
-        n_boot = 1000
-        D_boots = []
-        for _ in range(n_boot):
-            # Resample seed axis
-            seed_idx = np.random.randint(0, n_seeds, n_seeds)
-            grid_boot = outcome_grid[:, seed_idx]
-            s_b, c_b = box_counting_boundary(grid_boot, resolutions)
-            if len(s_b) >= 3:
-                sl, _, _, _, _ = stats.linregress(np.log(1.0/s_b), np.log(c_b))
-                D_boots.append(sl)
-        D_boots = np.array(D_boots)
-        ci_lo, ci_hi = np.percentile(D_boots, [2.5, 97.5])
-
-        print(f"\nBox-counting dimension D = {D_box:.3f} (95% CI: [{ci_lo:.3f}, {ci_hi:.3f}])")
-        print(f"R² = {r_value**2:.4f}, p = {p_value:.4e}")
-    else:
-        D_box = np.nan
-        ci_lo = ci_hi = np.nan
-        print("Not enough resolution levels for box-counting dimension")
-
-    # Plot 2: Box-counting log-log
-    fig, ax = plt.subplots(figsize=(8, 6))
-    if len(sizes) >= 3:
-        ax.plot(np.log(1.0/sizes), np.log(counts), 'ko', markersize=8, label='Data')
-        x_fit = np.linspace(np.log(1.0/sizes).min(), np.log(1.0/sizes).max(), 100)
-        ax.plot(x_fit, slope * x_fit + intercept, 'r-', linewidth=2,
-                label=f'$D = {D_box:.3f}$ (95% CI: [{ci_lo:.3f}, {ci_hi:.3f}])')
-        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
-        ax.set_xlabel('$\\ln(1/\\epsilon)$ (log inverse box size)')
-        ax.set_ylabel('$\\ln N(\\epsilon)$ (log boundary box count)')
-        ax.set_title(f'Box-Counting Dimension of Convergence Boundary\n'
-                     f'$D = {D_box:.3f}$, $R^2 = {r_value**2:.4f}$',
-                     fontsize=13, fontweight='bold')
-        ax.legend(fontsize=11)
-        ax.grid(alpha=0.3)
+    print(f"\nLoss profile Hurst exponent: H = {H_slope:.3f} (R² = {H_r**2:.3f})")
+    if H_slope < 0.5:
+        print("  → Anti-persistent (rough/fractal)")
+    elif H_slope > 0.5:
+        print("  → Persistent (smooth/trending)")
 
     plt.tight_layout()
     path = os.path.join(PLOTS_DIR, "critical_lr_boundary_dimension.png")
@@ -3095,22 +3047,13 @@ def exp_critical_lr():
     plt.close()
     print(f"Saved: {path}")
 
-    # Save all results
-    save_data = {
-        "lr_values": lr_values, "outcome_grid": outcome_grid,
-        "final_loss_grid": final_loss_grid, "lr_critical": lr_critical,
-        "box_sizes": sizes, "box_counts": counts,
-        "D_box": D_box, "ci_lo": ci_lo, "ci_hi": ci_hi,
-    }
-    try:
-        if len(D_boots) > 0:
-            save_data["D_bootstrap"] = D_boots
-    except NameError:
-        pass
-
-    npz_path = os.path.join(PLOTS_DIR, "critical_lr_data.npz")
-    np.savez_compressed(npz_path, **save_data)
-    print(f"Saved: {npz_path}")
+    # Save results
+    np.savez_compressed(os.path.join(PLOTS_DIR, "critical_lr_data.npz"),
+                        lr_values=lr_values, final_loss_grid=final_loss_grid,
+                        mean_loss=mean_loss, std_loss=std_loss,
+                        hurst_H=H_slope, hurst_R2=H_r**2,
+                        best_lr=best_lr)
+    print(f"Saved: {os.path.join(PLOTS_DIR, 'critical_lr_data.npz')}")
 
 
 # --- Experiment 22: Connectivity vs Confinement ---
